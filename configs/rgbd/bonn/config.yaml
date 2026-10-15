@@ -94,6 +94,30 @@ model_params:
     smoothing_kernel: 3
     save_debug: false
     debug_every: 30
+  # Optional V2: conservative flow + static RGB-D residual fusion for Tracking.
+  # Keep V1 (rgbd_uncertainty.enabled) disabled when using this.
+  flow_rgbd_v2:
+    enabled: false
+    warmup_iters: 6
+    refresh_interval: 8
+    opacity_min: 0.95
+    min_depth: 0.01
+    max_depth: 1000.0
+    min_coverage: 0.25
+    reject_depth_edges: true
+    edge_threshold: 0.08
+    flow_scale_floor_px: 0.30
+    flow_z_threshold: 2.0
+    flow_temperature: 0.50
+    front_min_rel: 0.035
+    front_temperature: 0.015
+    rgb_min_error: 0.08
+    rgb_temperature: 0.035
+    candidate_threshold: 0.55
+    min_weight: 0.70
+    max_downweight_fraction: 0.12
+    save_debug: false
+    debug_every: 30
   flow_offset: true
   insertion: true
   model_path: ''
