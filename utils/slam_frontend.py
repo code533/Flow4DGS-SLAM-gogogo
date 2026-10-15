@@ -14,6 +14,7 @@ from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import update_pose
 from utils.slam_utils import get_loss_tracking, get_median_depth, get_loss_network, pearson_loss
 from utils.uncertainty_fusion import compute_rgbd_uncertainty  # UP-FLOW-RGBD-V1
+from utils.flow_rgbd_fusion_v2 import compute_flow_rgbd_gate_v2, tracking_loss_v2  # UP-FLOW-RGBD-V2
 from gaussian_splatting.utils.loss_utils import l1_loss, ssim
 import os
 import matplotlib.pyplot as plt
@@ -204,6 +205,7 @@ class FrontEnd(mp.Process):
         self.flow_cam_maxt = config["model_params"].get("flow_cam_maxt", 0.01)
         self.flow_cam_maxr = config["model_params"].get("flow_cam_maxr", 0.1)
         self.rgbd_uncertainty_cfg = config["model_params"].get("rgbd_uncertainty", {})  # UP-FLOW-RGBD-V1
+        self.rgbd_v2_cfg = config["model_params"].get("flow_rgbd_v2", {})  # UP-FLOW-RGBD-V2
 
         self.dynamic_objects = 0
 
@@ -341,6 +343,7 @@ class FrontEnd(mp.Process):
         output_dir = os.path.join(self.config["Results"]["save_dir"], "tracking")
         os.makedirs(output_dir, exist_ok=True)
         initial_motion_mask = viewpoint.motion_mask.clone()
+        flow_residual_px_v2 = None  # V2 uses flow residual from the unmodified motion decomposition
 
         if self.flow_mask:
             if self.save_results:
@@ -363,6 +366,7 @@ class FrontEnd(mp.Process):
                                     motion_mask=viewpoint.motion_mask.cuda()
                                 )
             flow_mask = results['mask_bool']
+            flow_residual_px_v2 = results['resid_px'].detach()  # UP-FLOW-RGBD-V2
             
             viewpoint.motion_mask = viewpoint.motion_mask & (~flow_mask)
 
@@ -476,6 +480,14 @@ class FrontEnd(mp.Process):
 
         loss_tracking_init = 0.0
         rgbd_gate = None  # UP-FLOW-RGBD-V1; never written to viewpoint.motion_mask
+        v2_on = bool(self.rgbd_v2_cfg.get("enabled", False))
+        if v2_on and bool(self.rgbd_uncertainty_cfg.get("enabled", False)):
+            raise RuntimeError("Enable either rgbd_uncertainty (V1) or flow_rgbd_v2 (V2), not both")
+        if v2_on and self.monocular:
+            raise RuntimeError("Flow-RGBD V2 Tracking requires RGB-D input")
+        v2_gate = None
+        v2_update_count = 0
+        v2_last_iteration = -1
 
         for tracking_itr in range(self.tracking_itr_num):
             render_pkg = render(
@@ -512,6 +524,23 @@ class FrontEnd(mp.Process):
                                 applied=rgbd_gate["applied"],
                             )
 
+            # UP-FLOW-RGBD-V2: alternate pose refinement and fixed reliability weights.
+            # Do NOT overwrite viewpoint.motion_mask: Mapping still receives original mask.
+            v2c = self.rgbd_v2_cfg
+            warm = max(0, int(v2c.get("warmup_iters", 6)))
+            interval = max(1, int(v2c.get("refresh_interval", 8)))
+            if (v2_on and viewpoint.uid > 0 and tracking_itr >= warm
+                    and (tracking_itr - warm) % interval == 0):
+                with torch.no_grad():
+                    corrected_rgb = (torch.exp(viewpoint.exposure_a.detach()) * image.detach()
+                                     + viewpoint.exposure_b.detach())
+                    observed_depth = torch.as_tensor(viewpoint.depth, device=depth.device, dtype=depth.dtype)
+                    v2_gate = compute_flow_rgbd_gate_v2(
+                        corrected_rgb, depth, opacity, viewpoint.original_image.to(image.device),
+                        observed_depth, viewpoint.motion_mask.to(image.device), flow_residual_px_v2, v2c)
+                v2_update_count += 1
+                v2_last_iteration = tracking_itr
+
             # remove the dynamic object at frame 0
             with torch.no_grad():
                 if self.dynamic_model and self.gaussians.deform_init and False:
@@ -526,16 +555,22 @@ class FrontEnd(mp.Process):
                 weights = rgbd_gate["weights"]
                 mask = weights if mask is None else (weights * mask.float())
 
-            loss_tracking = get_loss_tracking(
-                self.config, 
-                image, 
-                depth, 
-                opacity, 
-                viewpoint, 
-                rm_dynamic=True, 
-                mask=mask, #not self.dynamic_model
-                save_img = False,
-            )
+            if v2_on and v2_gate is not None and v2_gate["applied"]:
+                # Mass-preserving normalization avoids changing the baseline loss
+                # solely because the number of softly weighted pixels changed.
+                loss_tracking = tracking_loss_v2(
+                    self.config, image, depth, opacity, viewpoint, v2_gate["weights"])
+            else:
+                loss_tracking = get_loss_tracking(
+                    self.config,
+                    image,
+                    depth,
+                    opacity,
+                    viewpoint,
+                    rm_dynamic=True,
+                    mask=mask,
+                    save_img=False,
+                )
 
             if tracking_itr == 0:
                 loss_tracking_init = loss_tracking.item()
@@ -555,6 +590,41 @@ class FrontEnd(mp.Process):
 
             if converged:
                 break
+
+        # Diagnostic files also record early convergence / skipped updates.
+        # This is independent of Results.save_results.
+        if v2_on and self.rgbd_v2_cfg.get("save_debug", False) and viewpoint.uid > 0:
+            debug_stride = max(int(self.rgbd_v2_cfg.get("debug_every", 30)), 1)
+            if viewpoint.uid % debug_stride == 0:
+                if v2_gate is None:
+                    sh = viewpoint.motion_mask.shape
+                    diag = {
+                        "weights": torch.ones(sh, device=image.device),
+                        "joint_score": torch.zeros(sh, device=image.device),
+                        "candidate": torch.zeros(sh, device=image.device, dtype=torch.bool),
+                        "valid": torch.zeros(sh, device=image.device, dtype=torch.bool),
+                        "coverage": 0.0,
+                        "effective_ratio": 0.0,
+                        "applied": False,
+                        "reason": "no_refresh_before_convergence",
+                    }
+                else:
+                    diag = v2_gate
+                np.savez_compressed(
+                    os.path.join(output_dir, "flow_rgbd_v2_{:05d}.npz".format(viewpoint.uid)),
+                    weights=diag["weights"].detach().cpu().numpy(),
+                    joint_score=diag["joint_score"].detach().cpu().numpy(),
+                    candidate=diag["candidate"].detach().cpu().numpy(),
+                    valid=diag["valid"].detach().cpu().numpy(),
+                    original_static=viewpoint.motion_mask.detach().cpu().numpy(),
+                    applied=diag["applied"], reason=diag["reason"],
+                    coverage=diag["coverage"], effective_ratio=diag["effective_ratio"],
+                    update_count=v2_update_count, last_update_iteration=v2_last_iteration,
+                )
+                print("[Flow-RGBD-V2] frame={} applied={} reason={} coverage={:.3f} "
+                      "downweight={:.3f} updates={}".format(
+                          viewpoint.uid, diag["applied"], diag["reason"],
+                          diag["coverage"], diag["effective_ratio"], v2_update_count))
 
         self.median_depth = get_median_depth(depth, opacity)
 
