@@ -76,6 +76,24 @@ model_params:
   dynamic_model: offset
   flow_cam: true
   flow_mask: true
+  rgbd_uncertainty:
+    enabled: false       # baseline off; turn on for V1 experiment
+    warmup_iters: 3
+    opacity_min: 0.95
+    min_depth: 0.01
+    max_depth: 1000.0
+    rgb_coeff: 0.40
+    depth_coeff: 0.60
+    rgb_scale: 0.10
+    depth_rel_scale: 0.10
+    threshold: 1.60
+    temperature: 0.35
+    min_weight: 0.10
+    min_coverage: 0.08
+    binary_threshold: 0.80 # diagnostics only
+    smoothing_kernel: 3
+    save_debug: false
+    debug_every: 30
   flow_offset: true
   insertion: true
   model_path: ''

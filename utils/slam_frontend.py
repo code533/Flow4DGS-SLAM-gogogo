@@ -13,6 +13,7 @@ from utils.logging_utils import Log
 from utils.multiprocessing_utils import clone_obj
 from utils.pose_utils import update_pose
 from utils.slam_utils import get_loss_tracking, get_median_depth, get_loss_network, pearson_loss
+from utils.uncertainty_fusion import compute_rgbd_uncertainty  # UP-FLOW-RGBD-V1
 from gaussian_splatting.utils.loss_utils import l1_loss, ssim
 import os
 import matplotlib.pyplot as plt
@@ -202,6 +203,7 @@ class FrontEnd(mp.Process):
         self.flow_cam_thres = config["model_params"].get("flow_cam_thres", 5.0)
         self.flow_cam_maxt = config["model_params"].get("flow_cam_maxt", 0.01)
         self.flow_cam_maxr = config["model_params"].get("flow_cam_maxr", 0.1)
+        self.rgbd_uncertainty_cfg = config["model_params"].get("rgbd_uncertainty", {})  # UP-FLOW-RGBD-V1
 
         self.dynamic_objects = 0
 
@@ -473,6 +475,7 @@ class FrontEnd(mp.Process):
                 plt.close()
 
         loss_tracking_init = 0.0
+        rgbd_gate = None  # UP-FLOW-RGBD-V1; never written to viewpoint.motion_mask
 
         for tracking_itr in range(self.tracking_itr_num):
             render_pkg = render(
@@ -483,6 +486,32 @@ class FrontEnd(mp.Process):
                 render_pkg["opacity"],
             )
             
+            # UP-FLOW-RGBD-V1: one detached RGB-D reliability map per tracked frame.
+            # The existing render contains only STATIC Gaussians. Keep the original
+            # semantic/flow hard mask and camera-motion initialization unchanged.
+            uc = self.rgbd_uncertainty_cfg
+            if (uc.get("enabled", False) and viewpoint.uid > 0
+                    and tracking_itr == int(uc.get("warmup_iters", 3))):
+                with torch.no_grad():
+                    pred_rgb = torch.exp(viewpoint.exposure_a.detach()) * image.detach() + viewpoint.exposure_b.detach()
+                    depth_gt = torch.from_numpy(viewpoint.depth).to(device=depth.device, dtype=depth.dtype)
+                    rgbd_gate = compute_rgbd_uncertainty(
+                        pred_rgb, depth, opacity, viewpoint.original_image.to(image.device),
+                        depth_gt, viewpoint.motion_mask.to(image.device), uc)
+                    if uc.get("save_debug", False):
+                        stride = max(int(uc.get("debug_every", 30)), 1)
+                        if viewpoint.uid % stride == 0:
+                            np.savez_compressed(
+                                os.path.join(output_dir, "rgbd_uncertainty_{:05d}.npz".format(viewpoint.uid)),
+                                uncertainty=rgbd_gate["uncertainty"].cpu().numpy(),
+                                weights=rgbd_gate["weights"].cpu().numpy(),
+                                valid=rgbd_gate["valid"].cpu().numpy(),
+                                dynamic_candidate=rgbd_gate["new_dynamic_candidate"].cpu().numpy(),
+                                original_static=viewpoint.motion_mask.cpu().numpy(),
+                                coverage=rgbd_gate["coverage"],
+                                applied=rgbd_gate["applied"],
+                            )
+
             # remove the dynamic object at frame 0
             with torch.no_grad():
                 if self.dynamic_model and self.gaussians.deform_init and False:
@@ -490,6 +519,12 @@ class FrontEnd(mp.Process):
                 else:
                     mask = None
 
+
+            # Original flow/semantic hard mask remains active in
+            # get_loss_tracking(); optional float mask adds soft pixel weights.
+            if rgbd_gate is not None and rgbd_gate["applied"]:
+                weights = rgbd_gate["weights"]
+                mask = weights if mask is None else (weights * mask.float())
 
             loss_tracking = get_loss_tracking(
                 self.config, 
