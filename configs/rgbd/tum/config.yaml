@@ -92,6 +92,38 @@ model_params:
     max_downweight_fraction: 0.12
     save_debug: false
     debug_every: 30
+  # V2.1: interpretable two-branch flow/RGB-D fusion. OFF by default.
+  # V1 and V2 must also be disabled when V2.1 is enabled.
+  flow_rgbd_v21:
+    enabled: false
+    fusion_mode: layered        # layered | product (V2-style ablation)
+    diagnostic_only: false     # true: record maps without changing Tracking
+    warmup_iters: 6
+    refresh_interval: 8
+    opacity_min: 0.95
+    min_depth: 0.01
+    max_depth: 1000.0
+    min_coverage: 0.25
+    reject_depth_edges: true
+    edge_threshold: 0.08
+    flow_scale_floor_px: 0.30
+    flow_z_threshold: 2.0
+    flow_temperature: 0.50
+    front_min_rel: 0.035
+    front_temperature: 0.015
+    rgb_min_error: 0.08
+    rgb_temperature: 0.035
+    rgb_share: 0.55
+    flow_share: 0.55
+    flow_prior_min: 0.35
+    map_prior_min: 0.35
+    layered_threshold: 0.55
+    product_threshold: 0.55
+    min_candidate_pixels: 32
+    min_weight: 0.80
+    max_downweight_fraction: 0.05
+    save_debug: true
+    debug_every: 30
   flow_offset: true
   insertion: true
   model_path: ''

@@ -15,6 +15,7 @@ from utils.pose_utils import update_pose
 from utils.slam_utils import get_loss_tracking, get_median_depth, get_loss_network, pearson_loss
 from utils.uncertainty_fusion import compute_rgbd_uncertainty  # UP-FLOW-RGBD-V1
 from utils.flow_rgbd_fusion_v2 import compute_flow_rgbd_gate_v2, tracking_loss_v2  # UP-FLOW-RGBD-V2
+from utils.flow_rgbd_fusion_v21 import compute_flow_rgbd_gate_v21  # UP-FLOW-RGBD-V21
 from gaussian_splatting.utils.loss_utils import l1_loss, ssim
 import os
 import matplotlib.pyplot as plt
@@ -206,6 +207,7 @@ class FrontEnd(mp.Process):
         self.flow_cam_maxr = config["model_params"].get("flow_cam_maxr", 0.1)
         self.rgbd_uncertainty_cfg = config["model_params"].get("rgbd_uncertainty", {})  # UP-FLOW-RGBD-V1
         self.rgbd_v2_cfg = config["model_params"].get("flow_rgbd_v2", {})  # UP-FLOW-RGBD-V2
+        self.rgbd_v21_cfg = config["model_params"].get("flow_rgbd_v21", {})  # UP-FLOW-RGBD-V21
 
         self.dynamic_objects = 0
 
@@ -481,13 +483,18 @@ class FrontEnd(mp.Process):
         loss_tracking_init = 0.0
         rgbd_gate = None  # UP-FLOW-RGBD-V1; never written to viewpoint.motion_mask
         v2_on = bool(self.rgbd_v2_cfg.get("enabled", False))
-        if v2_on and bool(self.rgbd_uncertainty_cfg.get("enabled", False)):
-            raise RuntimeError("Enable either rgbd_uncertainty (V1) or flow_rgbd_v2 (V2), not both")
-        if v2_on and self.monocular:
-            raise RuntimeError("Flow-RGBD V2 Tracking requires RGB-D input")
+        v21_on = bool(self.rgbd_v21_cfg.get("enabled", False))
+        v1_on = bool(self.rgbd_uncertainty_cfg.get("enabled", False))
+        if int(v1_on) + int(v2_on) + int(v21_on) > 1:
+            raise RuntimeError("Enable at most one of RGBD V1, Flow-RGBD V2, V2.1")
+        if (v2_on or v21_on) and self.monocular:
+            raise RuntimeError("Flow-RGBD fusion requires RGB-D input")
         v2_gate = None
         v2_update_count = 0
         v2_last_iteration = -1
+        v21_gate = None
+        v21_update_count = 0
+        v21_last_iteration = -1
 
         for tracking_itr in range(self.tracking_itr_num):
             render_pkg = render(
@@ -541,6 +548,23 @@ class FrontEnd(mp.Process):
                 v2_update_count += 1
                 v2_last_iteration = tracking_itr
 
+            # UP-FLOW-RGBD-V21: update both branch scores after short pose warmup.
+            # Scores/weights stay fixed between refreshes and are detached.
+            v21c = self.rgbd_v21_cfg
+            warm21 = max(0, int(v21c.get("warmup_iters", 6)))
+            interval21 = max(1, int(v21c.get("refresh_interval", 8)))
+            if (v21_on and viewpoint.uid > 0 and tracking_itr >= warm21
+                    and (tracking_itr - warm21) % interval21 == 0):
+                with torch.no_grad():
+                    corrected21 = (torch.exp(viewpoint.exposure_a.detach()) * image.detach()
+                                   + viewpoint.exposure_b.detach())
+                    v21_gate = compute_flow_rgbd_gate_v21(
+                        corrected21, depth, opacity, viewpoint.original_image.to(image.device),
+                        torch.as_tensor(viewpoint.depth, device=depth.device, dtype=depth.dtype),
+                        viewpoint.motion_mask.to(image.device), flow_residual_px_v2, v21c)
+                v21_update_count += 1
+                v21_last_iteration = tracking_itr
+
             # remove the dynamic object at frame 0
             with torch.no_grad():
                 if self.dynamic_model and self.gaussians.deform_init and False:
@@ -555,9 +579,11 @@ class FrontEnd(mp.Process):
                 weights = rgbd_gate["weights"]
                 mask = weights if mask is None else (weights * mask.float())
 
-            if v2_on and v2_gate is not None and v2_gate["applied"]:
-                # Mass-preserving normalization avoids changing the baseline loss
-                # solely because the number of softly weighted pixels changed.
+            if v21_on and v21_gate is not None and v21_gate["applied"]:
+                loss_tracking = tracking_loss_v2(
+                    self.config, image, depth, opacity, viewpoint, v21_gate["weights"])
+            elif v2_on and v2_gate is not None and v2_gate["applied"]:
+                # Preserve the original loss scale when weights are soft.
                 loss_tracking = tracking_loss_v2(
                     self.config, image, depth, opacity, viewpoint, v2_gate["weights"])
             else:
@@ -625,6 +651,58 @@ class FrontEnd(mp.Process):
                       "downweight={:.3f} updates={}".format(
                           viewpoint.uid, diag["applied"], diag["reason"],
                           diag["coverage"], diag["effective_ratio"], v2_update_count))
+
+
+        # UP-FLOW-RGBD-V21: diagnostics are independent of Results.save_results.
+        # Even frames converging before warmup write an explicit fallback record.
+        if v21_on and self.rgbd_v21_cfg.get("save_debug", False) and viewpoint.uid > 0:
+            every = max(1, int(self.rgbd_v21_cfg.get("debug_every", 30)))
+            if viewpoint.uid % every == 0:
+                diag21 = v21_gate
+                if diag21 is None:
+                    with torch.no_grad():
+                        corrected21 = (torch.exp(viewpoint.exposure_a.detach()) * image.detach()
+                                       + viewpoint.exposure_b.detach())
+                        diag21 = compute_flow_rgbd_gate_v21(
+                            corrected21, depth, opacity,
+                            viewpoint.original_image.to(image.device),
+                            torch.as_tensor(viewpoint.depth, device=depth.device, dtype=depth.dtype),
+                            viewpoint.motion_mask.to(image.device), flow_residual_px_v2,
+                            self.rgbd_v21_cfg)
+                    # Snapshot ONLY. This diagnostic did not affect Tracking.
+                    diag21["reason"] = "no_refresh_before_convergence"
+                    diag21["applied"] = False
+                    diag21["weights"] = torch.ones_like(diag21["weights"])
+                    diag21["effective_ratio"] = 0.0
+                image21 = torch.clamp(viewpoint.original_image.detach().cpu(), 0, 1)
+                debug_fields = {k: diag21[k].detach().cpu().numpy() for k in (
+                    "weights", "valid", "candidate_raw", "candidate",
+                    "original_static", "p_flow", "p_rgb", "p_front",
+                    "p_map", "score_product", "score_layered", "score_selected")}
+                debug_fields.update({
+                    "rgb_uint8": (image21.mul(255).byte().permute(1, 2, 0).numpy()),
+                    "reason": diag21["reason"], "applied": diag21["applied"],
+                    "mode": diag21["mode"], "coverage": diag21["coverage"],
+                    "effective_ratio": diag21["effective_ratio"],
+                    "count_flow_prior": diag21["count_flow_prior"],
+                    "count_map_prior": diag21["count_map_prior"],
+                    "count_both_priors": diag21["count_both_priors"],
+                    "count_raw": diag21["count_raw"],
+                    "count_selected": diag21["count_selected"],
+                    "update_count": v21_update_count,
+                    "last_update_iteration": v21_last_iteration,
+                })
+                np.savez_compressed(
+                    os.path.join(output_dir, "flow_rgbd_v21_{:05d}.npz".format(viewpoint.uid)),
+                    **debug_fields)
+                print("[Flow-RGBD-V2.1] frame={} mode={} reason={} valid_cov={:.3f} "
+                      "cues(flow/map/both)={}/{}/{} candidates(raw/selected)={}/{} "
+                      "downweight={:.6f} updates={}".format(
+                          viewpoint.uid, diag21["mode"], diag21["reason"],
+                          diag21["coverage"], diag21["count_flow_prior"],
+                          diag21["count_map_prior"], diag21["count_both_priors"],
+                          diag21["count_raw"], diag21["count_selected"],
+                          diag21["effective_ratio"], v21_update_count))
 
         self.median_depth = get_median_depth(depth, opacity)
 
