@@ -124,6 +124,39 @@ model_params:
     max_downweight_fraction: 0.05
     save_debug: true
     debug_every: 30
+  # V2.2: split RGB/Depth residual reliability for tracking. OFF by default.
+  # V1/V2/V2.1 and V2.2 are mutually exclusive.
+  flow_rgbd_v22:
+    enabled: false
+    mode: decoupled            # decoupled | rgb_only | depth_only | all_ones
+    diagnostic_only: false
+    normalization: mass_preserving   # mass_preserving | original_mean
+    warmup_iters: 6
+    refresh_interval: 8
+    opacity_min: 0.95
+    min_depth: 0.01
+    max_depth: 1000.0
+    min_coverage: 0.25
+    reject_depth_edges: true
+    edge_threshold: 0.08
+    flow_scale_floor_px: 0.30
+    flow_z_threshold: 2.0
+    flow_temperature: 0.50
+    front_min_rel: 0.035
+    front_temperature: 0.015
+    rgb_min_error: 0.08
+    rgb_temperature: 0.035
+    flow_prior_min: 0.35
+    rgb_prior_min: 0.55
+    depth_prior_min: 0.65
+    rgb_min_weight: 0.95
+    depth_min_weight: 0.80
+    rgb_max_fraction: 0.015
+    depth_max_fraction: 0.03
+    rgb_min_candidate_pixels: 32
+    depth_min_candidate_pixels: 32
+    save_debug: false
+    debug_every: 30
   flow_offset: true
   insertion: true
   model_path: ''

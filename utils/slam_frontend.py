@@ -16,6 +16,7 @@ from utils.slam_utils import get_loss_tracking, get_median_depth, get_loss_netwo
 from utils.uncertainty_fusion import compute_rgbd_uncertainty  # UP-FLOW-RGBD-V1
 from utils.flow_rgbd_fusion_v2 import compute_flow_rgbd_gate_v2, tracking_loss_v2  # UP-FLOW-RGBD-V2
 from utils.flow_rgbd_fusion_v21 import compute_flow_rgbd_gate_v21  # UP-FLOW-RGBD-V21
+from utils.flow_rgbd_fusion_v22 import compute_decoupled_weights, tracking_loss_decoupled  # UP-FLOW-RGBD-V22
 from gaussian_splatting.utils.loss_utils import l1_loss, ssim
 import os
 import matplotlib.pyplot as plt
@@ -208,6 +209,7 @@ class FrontEnd(mp.Process):
         self.rgbd_uncertainty_cfg = config["model_params"].get("rgbd_uncertainty", {})  # UP-FLOW-RGBD-V1
         self.rgbd_v2_cfg = config["model_params"].get("flow_rgbd_v2", {})  # UP-FLOW-RGBD-V2
         self.rgbd_v21_cfg = config["model_params"].get("flow_rgbd_v21", {})  # UP-FLOW-RGBD-V21
+        self.rgbd_v22_cfg = config["model_params"].get("flow_rgbd_v22", {})  # UP-FLOW-RGBD-V22
 
         self.dynamic_objects = 0
 
@@ -484,10 +486,11 @@ class FrontEnd(mp.Process):
         rgbd_gate = None  # UP-FLOW-RGBD-V1; never written to viewpoint.motion_mask
         v2_on = bool(self.rgbd_v2_cfg.get("enabled", False))
         v21_on = bool(self.rgbd_v21_cfg.get("enabled", False))
+        v22_on = bool(self.rgbd_v22_cfg.get("enabled", False))
         v1_on = bool(self.rgbd_uncertainty_cfg.get("enabled", False))
-        if int(v1_on) + int(v2_on) + int(v21_on) > 1:
-            raise RuntimeError("Enable at most one of RGBD V1, Flow-RGBD V2, V2.1")
-        if (v2_on or v21_on) and self.monocular:
+        if sum([v1_on, v2_on, v21_on, v22_on]) > 1:
+            raise RuntimeError("Enable only one of RGBD V1, Flow-RGBD V2, V2.1, V2.2")
+        if (v2_on or v21_on or v22_on) and self.monocular:
             raise RuntimeError("Flow-RGBD fusion requires RGB-D input")
         v2_gate = None
         v2_update_count = 0
@@ -495,6 +498,9 @@ class FrontEnd(mp.Process):
         v21_gate = None
         v21_update_count = 0
         v21_last_iteration = -1
+        v22_gate = None
+        v22_update_count = 0
+        v22_last_iteration = -1
 
         for tracking_itr in range(self.tracking_itr_num):
             render_pkg = render(
@@ -565,6 +571,31 @@ class FrontEnd(mp.Process):
                 v21_update_count += 1
                 v21_last_iteration = tracking_itr
 
+            # UP-FLOW-RGBD-V22: extract detached V2.1 cues then split
+            # RGB and Depth reliabilities. Camera decomposition, masks and
+            # 4D Mapping are deliberately unchanged.
+            v22c = self.rgbd_v22_cfg
+            v22warm = max(int(v22c.get("warmup_iters", 6)), 0)
+            v22interval = max(int(v22c.get("refresh_interval", 8)), 1)
+            if (v22_on and viewpoint.uid > 0 and tracking_itr >= v22warm
+                    and (tracking_itr - v22warm) % v22interval == 0):
+                with torch.no_grad():
+                    corrected22 = (torch.exp(viewpoint.exposure_a.detach()) * image.detach()
+                                   + viewpoint.exposure_b.detach())
+                    # We only need the V2.1 cue maps, not its shared weight.
+                    cue_cfg = dict(self.rgbd_v21_cfg)
+                    cue_cfg.update(v22c)
+                    cue_cfg["diagnostic_only"] = True
+                    cues22 = compute_flow_rgbd_gate_v21(
+                        corrected22, depth, opacity,
+                        viewpoint.original_image.to(image.device),
+                        torch.as_tensor(viewpoint.depth, device=depth.device, dtype=depth.dtype),
+                        viewpoint.motion_mask.to(image.device), flow_residual_px_v2, cue_cfg)
+                    v22_gate = compute_decoupled_weights(cues22, v22c)
+                    v22_gate["cue_reason"] = cues22["reason"]
+                v22_update_count += 1
+                v22_last_iteration = tracking_itr
+
             # remove the dynamic object at frame 0
             with torch.no_grad():
                 if self.dynamic_model and self.gaussians.deform_init and False:
@@ -579,7 +610,18 @@ class FrontEnd(mp.Process):
                 weights = rgbd_gate["weights"]
                 mask = weights if mask is None else (weights * mask.float())
 
-            if v21_on and v21_gate is not None and v21_gate["applied"]:
+            if v22_on and self.rgbd_v22_cfg.get("mode", "decoupled") == "all_ones" and not self.rgbd_v22_cfg.get("diagnostic_only", False):
+                # Strict control experiment: custom loss, BOTH weights == 1
+                unit22 = torch.ones_like(opacity[0]).detach()
+                loss_tracking = tracking_loss_decoupled(
+                    self.config, image, depth, opacity, viewpoint, unit22, unit22,
+                    normalization=self.rgbd_v22_cfg.get("normalization", "mass_preserving"))
+            elif v22_on and v22_gate is not None and v22_gate["applied"]:
+                loss_tracking = tracking_loss_decoupled(
+                    self.config, image, depth, opacity, viewpoint,
+                    v22_gate["rgb_weights"], v22_gate["depth_weights"],
+                    normalization=self.rgbd_v22_cfg.get("normalization", "mass_preserving"))
+            elif v21_on and v21_gate is not None and v21_gate["applied"]:
                 loss_tracking = tracking_loss_v2(
                     self.config, image, depth, opacity, viewpoint, v21_gate["weights"])
             elif v2_on and v2_gate is not None and v2_gate["applied"]:
@@ -703,6 +745,57 @@ class FrontEnd(mp.Process):
                           diag21["count_map_prior"], diag21["count_both_priors"],
                           diag21["count_raw"], diag21["count_selected"],
                           diag21["effective_ratio"], v21_update_count))
+
+
+        # UP-FLOW-RGBD-V22: explicit split RGB/Depth diagnostics, including
+        # frames that converged before the first refresh.
+        if v22_on and self.rgbd_v22_cfg.get("save_debug", False) and viewpoint.uid > 0:
+            every22 = max(int(self.rgbd_v22_cfg.get("debug_every", 30)), 1)
+            if viewpoint.uid % every22 == 0:
+                d22 = v22_gate
+                if d22 is None:
+                    sh22 = viewpoint.motion_mask.shape
+                    zeros22 = torch.zeros(sh22, device=image.device)
+                    ones22 = torch.ones_like(zeros22)
+                    d22 = {
+                        "rgb_weights": ones22, "depth_weights": ones22,
+                        "rgb_score": zeros22, "depth_score": zeros22,
+                        "rgb_candidate": zeros22.bool(), "depth_candidate": zeros22.bool(),
+                        "valid": zeros22.bool(), "coverage": 0.0,
+                        "rgb_raw_count": 0, "depth_raw_count": 0,
+                        "rgb_selected_count": 0, "depth_selected_count": 0,
+                        "rgb_changed_fraction": 0.0, "depth_changed_fraction": 0.0,
+                        "applied": False, "reason": "no_refresh_before_convergence",
+                        "mode": self.rgbd_v22_cfg.get("mode", "decoupled"),
+                        "cue_reason": "not_computed",
+                    }
+                save22 = {name: d22[name].detach().cpu().numpy() for name in (
+                    "rgb_weights", "depth_weights", "rgb_score", "depth_score",
+                    "rgb_candidate", "depth_candidate", "valid")}
+                save22.update({
+                    "original_static": viewpoint.motion_mask.detach().cpu().numpy(),
+                    "mode": d22["mode"], "reason": d22["reason"],
+                    "cue_reason": d22.get("cue_reason", "not_computed"),
+                    "applied": d22["applied"], "coverage": d22["coverage"],
+                    "rgb_raw_count": d22["rgb_raw_count"],
+                    "depth_raw_count": d22["depth_raw_count"],
+                    "rgb_selected_count": d22["rgb_selected_count"],
+                    "depth_selected_count": d22["depth_selected_count"],
+                    "rgb_changed_fraction": d22["rgb_changed_fraction"],
+                    "depth_changed_fraction": d22["depth_changed_fraction"],
+                    "update_count": v22_update_count,
+                    "last_update_iteration": v22_last_iteration,
+                })
+                np.savez_compressed(
+                    os.path.join(output_dir, "flow_rgbd_v22_{:05d}.npz".format(viewpoint.uid)),
+                    **save22)
+                print("[Flow-RGBD-V2.2] frame={} mode={} reason={} rgb={}/{} "
+                      "depth={}/{} changed={:.6f}/{:.6f} updates={}".format(
+                          viewpoint.uid, d22["mode"], d22["reason"],
+                          d22["rgb_selected_count"], d22["rgb_raw_count"],
+                          d22["depth_selected_count"], d22["depth_raw_count"],
+                          d22["rgb_changed_fraction"], d22["depth_changed_fraction"],
+                          v22_update_count))
 
         self.median_depth = get_median_depth(depth, opacity)
 
