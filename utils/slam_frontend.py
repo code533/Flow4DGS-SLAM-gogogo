@@ -25,6 +25,7 @@ from utils.slam_backend import segment_motion_parametric, fit_twist_weighted, pi
 import torch.nn.functional as F
 from utils.pose_utils import SE3_exp, scale_se3_step, SO3_exp, so3_log
 from utils.camera_motion_v30 import translation_step, condition_number_normalized_jacobian, rigid_transform  # CIMD-V30
+from utils.camera_motion_v31 import fit_geometry_irls  # CIMD-V31
 
 
 def flow_to_pixels(flow_norm, H, W, mode='grid'):
@@ -212,6 +213,7 @@ class FrontEnd(mp.Process):
         self.rgbd_v21_cfg = config["model_params"].get("flow_rgbd_v21", {})  # UP-FLOW-RGBD-V21
         self.rgbd_v22_cfg = config["model_params"].get("flow_rgbd_v22", {})  # UP-FLOW-RGBD-V22
         self.flow_cam_v30_cfg = config["model_params"].get("flow_cam_v30", {})  # CIMD-V30
+        self.flow_cam_v31_cfg = config["model_params"].get("flow_cam_v31", {})  # CIMD-V31
 
         self.dynamic_objects = 0
 
@@ -363,6 +365,25 @@ class FrontEnd(mp.Process):
         v30log = (v30on and bool(v30cfg.get("save_debug", False)) and
                   viewpoint.uid > 0 and viewpoint.uid % v30_stride == 0)
         v30data = None
+        # CIMD-V31: isolate first fit vs static-only refit experiments.
+        v31cfg = self.flow_cam_v31_cfg
+        v31on = bool(v31cfg.get("enabled", False))
+        v31stage = str(v31cfg.get("stage", "refit_only"))
+        if v31on and not (self.flow_mask and self.flow_cam):
+            raise RuntimeError("CIMD-V31 requires flow_mask and flow_cam")
+        if v31on and v31stage not in ("first_only", "refit_only", "both"):
+            raise ValueError("CIMD-V31 stage: first_only | refit_only | both")
+        if v31on and any((self.rgbd_uncertainty_cfg.get("enabled", False),
+                           self.rgbd_v2_cfg.get("enabled", False),
+                           self.rgbd_v21_cfg.get("enabled", False),
+                           self.rgbd_v22_cfg.get("enabled", False))):
+            raise RuntimeError("Disable V1-V2.2 Tracking gates for CIMD-V31")
+        v31debug = (v31on and bool(v31cfg.get("save_debug", False)) and
+                    viewpoint.uid > 0 and
+                    viewpoint.uid % max(1, int(v31cfg.get("debug_every", 30))) == 0)
+        v31first = None
+        v31refit = None
+        v31tracking_initial = None
 
         if self.flow_mask:
             if self.save_results:
@@ -382,8 +403,11 @@ class FrontEnd(mp.Process):
                                     ds=1,
                                     robust_iters=30,
                                     k_mad=self.flow_cam_thres,
-                                    motion_mask=viewpoint.motion_mask.cuda()
+                                    motion_mask=viewpoint.motion_mask.cuda(),
+                                    geometry_cfg=(v31cfg if v31on and v31stage in ("first_only", "both") else None),
                                 )
+            if v31on:
+                v31first = results.get("fit_diag")
             flow_mask = results['mask_bool']
             flow_residual_px_v2 = results['resid_px'].detach()  # UP-FLOW-RGBD-V2
             
@@ -423,7 +447,19 @@ class FrontEnd(mp.Process):
                 depth_valid = (depth_tensor > 0) & torch.isfinite(depth_tensor)
                 depth_ds, depth_valid_ds, flow_px_ds, Kds = depth_tensor, depth_valid, flow_px, viewpoint.intrinsic.cuda()
                 
-                xi = fit_twist_weighted(depth_ds, flow_px_ds, Kds, static_inliers_ds, robust=True, iters=30)
+                if v31on and v31stage in ("refit_only", "both"):
+                    xi_geo, v31refit = fit_geometry_irls(
+                        depth_ds, flow_px_ds, Kds, static_inliers_ds, v31cfg)
+                    if xi_geo is not None:
+                        xi = xi_geo
+                        v31refit["fallback_used"] = False
+                    else:
+                        xi = fit_twist_weighted(
+                            depth_ds, flow_px_ds, Kds, static_inliers_ds, robust=True, iters=30)
+                        v31refit["fallback_used"] = True
+                else:
+                    xi = fit_twist_weighted(
+                        depth_ds, flow_px_ds, Kds, static_inliers_ds, robust=True, iters=30)
                 if v30log:
                     v30_xi_refined = xi.detach().clone()
 
@@ -480,6 +516,10 @@ class FrontEnd(mp.Process):
 
                 viewpoint.R = T_curr[:3,:3]
                 viewpoint.T = T_curr[:3, 3]
+                if v31debug:
+                    v31tracking_initial = rigid_transform(viewpoint.R, viewpoint.T).detach().cpu().numpy()
+                    v31twist_first = results["xi"].detach().cpu().numpy()
+                    v31twist_refit = xi.detach().cpu().numpy()
                 if v30log:
                     with torch.no_grad():
                         resid0 = results["resid_px"].detach()
@@ -886,6 +926,39 @@ class FrontEnd(mp.Process):
                           v30data["scale_translation_applied"], v30data["static_fraction"],
                           v30data["residual_first_median"], v30data["residual_second_median"],
                           v30data["condition_normalized"]))
+
+
+        # CIMD-V31: offline-only snapshots, never used by the estimator.
+        if v31debug:
+            if v31tracking_initial is None:
+                raise RuntimeError("CIMD-V31 logging requested but fit did not execute")
+            def stage_fields(prefix, entry):
+                d = {} if entry is None else entry
+                return {
+                    prefix + "_status": d.get("status", "legacy_not_modified"),
+                    prefix + "_fallback": bool(d.get("fallback_used", False)),
+                    prefix + "_samples": int(d.get("n_points", 0)),
+                    prefix + "_occupied_cells": int(d.get("occupied_cells", 0)),
+                    prefix + "_condition": float(d.get("condition", float("nan"))),
+                    prefix + "_median_residual_px": float(d.get("median_residual_px", float("nan"))),
+                    prefix + "_depth_edge_fraction": float(d.get("depth_edge_fraction", float("nan"))),
+                    prefix + "_flow_edge_fraction": float(d.get("flow_edge_fraction", float("nan"))),
+                }
+            diag31 = dict(stage=v31stage, xi_first=v31twist_first, xi_refined=v31twist_refit,
+                          T_tracking_initial=v31tracking_initial,
+                          T_tracking_optimized=rigid_transform(viewpoint.R, viewpoint.T).detach().cpu().numpy())
+            diag31.update(stage_fields("first", v31first))
+            diag31.update(stage_fields("refit", v31refit))
+            np.savez_compressed(
+                os.path.join(output_dir, "camera_motion_v31_{:05d}.npz".format(viewpoint.uid)),
+                **diag31)
+            print("[CIMD-V3.1] frame={} stage={} first={} refit={} fallback={}/{} "
+                  "samples={}/{} cond={:.2e}/{:.2e}".format(
+                      viewpoint.uid, v31stage,
+                      diag31["first_status"], diag31["refit_status"],
+                      diag31["first_fallback"], diag31["refit_fallback"],
+                      diag31["first_samples"], diag31["refit_samples"],
+                      diag31["first_condition"], diag31["refit_condition"]))
 
         self.median_depth = get_median_depth(depth, opacity)
 

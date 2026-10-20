@@ -303,6 +303,7 @@ def segment_motion_parametric(
     robust_iters=2,
     k_mad=3.5,
     motion_mask=None,
+    geometry_cfg=None,  # CIMD-V31: optional geometry-aware first fit
 ):
     """
     Efficient motion segmentation via depth–flow parametric fit.
@@ -336,7 +337,22 @@ def segment_motion_parametric(
     else:
         depth_ds, depth_valid_ds, flow_px_ds, Kds = depth, depth_valid, flow_px, K
 
-    xi = fit_twist_weighted(depth_ds, flow_px_ds, Kds, depth_valid_ds, robust=True, iters=robust_iters,)
+    # CIMD-V31: optional geometry-aware first fit; robust legacy fallback.
+    geo_diag = None
+    if geometry_cfg is not None and geometry_cfg.get("enabled", False):
+        from utils.camera_motion_v31 import fit_geometry_irls
+        xi_trial, geo_diag = fit_geometry_irls(
+            depth_ds, flow_px_ds, Kds, depth_valid_ds, geometry_cfg)
+        if xi_trial is None:
+            xi = fit_twist_weighted(
+                depth_ds, flow_px_ds, Kds, depth_valid_ds, robust=True, iters=robust_iters)
+            geo_diag["fallback_used"] = True
+        else:
+            xi = xi_trial
+            geo_diag["fallback_used"] = False
+    else:
+        xi = fit_twist_weighted(
+            depth_ds, flow_px_ds, Kds, depth_valid_ds, robust=True, iters=robust_iters)
 
     rigid_flow_px = predict_rigid_flow_px(depth, K, xi)
 
@@ -346,7 +362,7 @@ def segment_motion_parametric(
     if resid_valid.numel() == 0:
         mask_bool = torch.zeros_like(depth, dtype=torch.bool)
         rigid_flow_out = pixels_to_flow_units(rigid_flow_px, H, W, mode=flow_mode)
-        return dict(mask_bool=mask_bool, rigid_flow_out=rigid_flow_out, resid_px=resid, xi=xi)
+        return dict(mask_bool=mask_bool, rigid_flow_out=rigid_flow_out, resid_px=resid, xi=xi, fit_diag=geo_diag)
 
     med = resid_valid.median()
     mad = (resid_valid - med).abs().median().clamp_min(1e-6)
@@ -362,7 +378,8 @@ def segment_motion_parametric(
         mask_bool=mask_bool,
         rigid_flow_out=rigid_flow_out,
         resid_px=resid,
-        xi=xi
+        xi=xi,
+        fit_diag=geo_diag,
     )
 
         
