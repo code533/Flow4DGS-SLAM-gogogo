@@ -24,6 +24,7 @@ import random
 from utils.slam_backend import segment_motion_parametric, fit_twist_weighted, pixels_to_flow_units, flow_to_pixels
 import torch.nn.functional as F
 from utils.pose_utils import SE3_exp, scale_se3_step, SO3_exp, so3_log
+from utils.camera_motion_v30 import translation_step, condition_number_normalized_jacobian, rigid_transform  # CIMD-V30
 
 
 def flow_to_pixels(flow_norm, H, W, mode='grid'):
@@ -210,6 +211,7 @@ class FrontEnd(mp.Process):
         self.rgbd_v2_cfg = config["model_params"].get("flow_rgbd_v2", {})  # UP-FLOW-RGBD-V2
         self.rgbd_v21_cfg = config["model_params"].get("flow_rgbd_v21", {})  # UP-FLOW-RGBD-V21
         self.rgbd_v22_cfg = config["model_params"].get("flow_rgbd_v22", {})  # UP-FLOW-RGBD-V22
+        self.flow_cam_v30_cfg = config["model_params"].get("flow_cam_v30", {})  # CIMD-V30
 
         self.dynamic_objects = 0
 
@@ -348,6 +350,19 @@ class FrontEnd(mp.Process):
         os.makedirs(output_dir, exist_ok=True)
         initial_motion_mask = viewpoint.motion_mask.clone()
         flow_residual_px_v2 = None  # V2 uses flow residual from the unmodified motion decomposition
+        # CIMD-V30: diagnostics and optional translation clamp are isolated
+        # from V1-V2.2 tracking-weight experiments.
+        v30cfg = self.flow_cam_v30_cfg
+        v30on = bool(v30cfg.get("enabled", False))
+        if v30on and not (self.flow_mask and self.flow_cam):
+            raise RuntimeError("CIMD-V30 requires both flow_mask and flow_cam enabled")
+        v30mode = str(v30cfg.get("translation_mode", "legacy"))
+        if v30on and v30mode not in ("legacy", "capped"):
+            raise ValueError("CIMD-V30 translation_mode must be legacy or capped")
+        v30_stride = max(1, int(v30cfg.get("debug_every", 10)))
+        v30log = (v30on and bool(v30cfg.get("save_debug", False)) and
+                  viewpoint.uid > 0 and viewpoint.uid % v30_stride == 0)
+        v30data = None
 
         if self.flow_mask:
             if self.save_results:
@@ -392,6 +407,8 @@ class FrontEnd(mp.Process):
             if self.flow_cam:
 
                 xi = results['xi']                                # [6], on CUDA/float32 already
+                if v30log:
+                    v30_xi_initial = xi.detach().clone()
 
                 depth_valid = (depth_tensor > 0) & torch.isfinite(depth_tensor)
 
@@ -407,6 +424,8 @@ class FrontEnd(mp.Process):
                 depth_ds, depth_valid_ds, flow_px_ds, Kds = depth_tensor, depth_valid, flow_px, viewpoint.intrinsic.cuda()
                 
                 xi = fit_twist_weighted(depth_ds, flow_px_ds, Kds, static_inliers_ds, robust=True, iters=30)
+                if v30log:
+                    v30_xi_refined = xi.detach().clone()
 
                 rigid_flow_px = predict_rigid_flow_px(depth_ds, Kds, xi)
                 rigid_flow_out = pixels_to_flow_units(rigid_flow_px, H, W, mode='grid')
@@ -424,6 +443,8 @@ class FrontEnd(mp.Process):
                 T_prev[:3,  3] = t_prev
 
                 T_new = T_prev @ T_rel                         
+                if v30log:
+                    v30_raw_T = T_new.detach().clone()
 
                 T_curr = T_new
 
@@ -444,7 +465,12 @@ class FrontEnd(mp.Process):
 
                 s = torch.clamp(torch.minimum(s_t, s_r), max=1.0)
 
-                delta_t_scaled = s_t * delta_t
+                # CIMD-V30: preserve bitwise legacy behavior when disabled.
+                if v30on:
+                    delta_t_scaled, v30_ratio, v30_scale = translation_step(
+                        delta_t, max_translation, mode=v30mode)
+                else:
+                    delta_t_scaled = s_t * delta_t
 
                 w = so3_log(delta_R)
                 delta_R_scaled = SO3_exp(s * w) 
@@ -454,6 +480,46 @@ class FrontEnd(mp.Process):
 
                 viewpoint.R = T_curr[:3,:3]
                 viewpoint.T = T_curr[:3, 3]
+                if v30log:
+                    with torch.no_grad():
+                        resid0 = results["resid_px"].detach()
+                        resid1 = (flow_px - rigid_flow_px).pow(2).sum(dim=0).sqrt()
+                        static_resid0 = resid0[static_refit_mask]
+                        static_resid1 = resid1[static_refit_mask]
+                        cond30, cond_n30 = condition_number_normalized_jacobian(
+                            depth_tensor, viewpoint.intrinsic.cuda(), static_refit_mask,
+                            stride=max(1, int(v30cfg.get("condition_stride", 8))))
+                        def robust_median(t):
+                            return float(t.median().item()) if t.numel() else float("nan")
+                        v30data = dict(
+                            xi_initial=v30_xi_initial.detach().cpu().numpy(),
+                            xi_refined=v30_xi_refined.detach().cpu().numpy(),
+                            T_previous=rigid_transform(prev.R, prev.T).detach().cpu().numpy(),
+                            T_raw=v30_raw_T.cpu().numpy(),
+                            T_tracking_initial=rigid_transform(viewpoint.R, viewpoint.T).cpu().numpy(),
+                            translation_raw=float(trans_norm.item()),
+                            translation_applied=float(delta_t_scaled.norm().item()),
+                            translation_max=float(max_translation),
+                            scale_translation_unclamped=float(s_t.item()),
+                            scale_translation_applied=float(v30_scale.item()),
+                            rotation_raw_rad=float(angle.item()),
+                            rotation_applied_rad=float((s * w).norm().item()),
+                            rotation_max_rad=float(max_rot.item()),
+                            scale_rotation_joint=float(s.item()),
+                            static_inliers=int(static_refit_mask.sum().item()),
+                            static_fraction=float(valid_extent),
+                            residual_first_median=robust_median(static_resid0),
+                            residual_second_median=robust_median(static_resid1),
+                            condition_normalized=float(cond30),
+                            condition_sample_count=int(cond_n30),
+                            translation_mode=v30mode,
+                        )
+                        if bool(v30cfg.get("save_residual_maps", False)):
+                            v30data.update({
+                                "residual_first_px": resid0.cpu().numpy().astype(np.float32),
+                                "residual_second_px": resid1.cpu().numpy().astype(np.float32),
+                                "static_inlier_mask": static_refit_mask.cpu().numpy(),
+                            })
 
 
 
@@ -796,6 +862,30 @@ class FrontEnd(mp.Process):
                           d22["depth_selected_count"], d22["depth_raw_count"],
                           d22["rgb_changed_fraction"], d22["depth_changed_fraction"],
                           v22_update_count))
+
+        # CIMD-V30: save *after* Tracking for initial/optimized pose comparison.
+        # The GT transform below is diagnostic ONLY; no optimizer reads it.
+        if v30log:
+            if v30data is None:
+                raise RuntimeError("CIMD-V30 debug enabled but motion estimator did not run")
+            with torch.no_grad():
+                v30data["T_tracking_optimized"] = rigid_transform(
+                    viewpoint.R, viewpoint.T).cpu().numpy()
+                if hasattr(viewpoint, "R_gt") and hasattr(viewpoint, "T_gt"):
+                    v30data["T_gt"] = rigid_transform(
+                        viewpoint.R_gt.to(viewpoint.R.device),
+                        viewpoint.T_gt.to(viewpoint.T.device)).cpu().numpy()
+                np.savez_compressed(
+                    os.path.join(output_dir, "camera_motion_v30_{:05d}.npz".format(viewpoint.uid)),
+                    **v30data)
+                print("[CIMD-V3.0] frame={} mode={} raw_t={:.6f} applied_t={:.6f} "
+                      "limit={:.6f} scale={:.3f} inliers={:.3f} "
+                      "resid_med={:.3f}->{:.3f} cond={:.2e}".format(
+                          viewpoint.uid, v30mode, v30data["translation_raw"],
+                          v30data["translation_applied"], v30data["translation_max"],
+                          v30data["scale_translation_applied"], v30data["static_fraction"],
+                          v30data["residual_first_median"], v30data["residual_second_median"],
+                          v30data["condition_normalized"]))
 
         self.median_depth = get_median_depth(depth, opacity)
 

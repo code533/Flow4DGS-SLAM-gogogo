@@ -75,6 +75,15 @@ model_params:
   depth_check: true
   dynamic_model: offset
   flow_cam: true
+  # CIMD-V3.0 camera-motion diagnostics / optional translation cap.
+  # V1/V2/V2.1/V2.2 should all be disabled for controlled experiments.
+  flow_cam_v30:
+    enabled: false              # enable for V3.0 experiments
+    translation_mode: legacy    # legacy | capped (only changes translation)
+    save_debug: false
+    debug_every: 10
+    condition_stride: 8
+    save_residual_maps: false
   flow_mask: true
   rgbd_uncertainty:
     enabled: false       # baseline off; turn on for V1 experiment
