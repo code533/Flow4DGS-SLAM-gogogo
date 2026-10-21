@@ -194,6 +194,27 @@ model_params:
     max_condition: 1.0e7
     save_debug: false
     debug_every: 30
+  # V3.1a paired Shadow Mode: never changes Tracking pose.
+  # Requires V3.0, V3.1 and all earlier Tracking experiments disabled.
+  flow_cam_v31a:
+    enabled: false
+    save_debug: false
+    debug_every: 1
+    sampling_stride: 4
+    grid_rows: 6
+    grid_cols: 8
+    grid_balance: 0.50
+    iterations: 12
+    min_points: 600
+    min_cells: 12
+    min_depth: 0.10
+    max_depth: 15.0
+    depth_edge_relative: 0.06
+    depth_edge_weight: 0.35
+    flow_edge_px: 3.0
+    flow_edge_weight: 0.60
+    robust_scale_floor_px: 0.25
+    max_condition: 1.0e7
   flow_mask: true
   rgbd_uncertainty:
     enabled: false       # baseline off; turn on for V1 experiment

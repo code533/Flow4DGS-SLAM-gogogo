@@ -26,6 +26,7 @@ import torch.nn.functional as F
 from utils.pose_utils import SE3_exp, scale_se3_step, SO3_exp, so3_log
 from utils.camera_motion_v30 import translation_step, condition_number_normalized_jacobian, rigid_transform  # CIMD-V30
 from utils.camera_motion_v31 import fit_geometry_irls  # CIMD-V31
+from utils.camera_motion_v31a import compare_flow_residuals, candidate_initial_pose  # CIMD-V31A
 
 
 def flow_to_pixels(flow_norm, H, W, mode='grid'):
@@ -214,6 +215,7 @@ class FrontEnd(mp.Process):
         self.rgbd_v22_cfg = config["model_params"].get("flow_rgbd_v22", {})  # UP-FLOW-RGBD-V22
         self.flow_cam_v30_cfg = config["model_params"].get("flow_cam_v30", {})  # CIMD-V30
         self.flow_cam_v31_cfg = config["model_params"].get("flow_cam_v31", {})  # CIMD-V31
+        self.flow_cam_v31a_cfg = config["model_params"].get("flow_cam_v31a", {})  # CIMD-V31A
 
         self.dynamic_objects = 0
 
@@ -384,6 +386,23 @@ class FrontEnd(mp.Process):
         v31first = None
         v31refit = None
         v31tracking_initial = None
+        # CIMD-V31A Shadow Mode: preserve the original fit for actual Tracking.
+        v31acfg = self.flow_cam_v31a_cfg
+        v31a_on = bool(v31acfg.get("enabled", False))
+        if v31a_on and (v31on or v30on or any((
+                self.rgbd_uncertainty_cfg.get("enabled", False),
+                self.rgbd_v2_cfg.get("enabled", False),
+                self.rgbd_v21_cfg.get("enabled", False),
+                self.rgbd_v22_cfg.get("enabled", False)))):
+            raise RuntimeError("Shadow Mode requires V1-V3.1, including V3.0, disabled")
+        if v31a_on and not (self.flow_mask and self.flow_cam):
+            raise RuntimeError("Shadow Mode requires flow_mask and flow_cam")
+        v31a_log = (v31a_on and bool(v31acfg.get("save_debug", False))
+                    and viewpoint.uid > 0
+                    and viewpoint.uid % max(1, int(v31acfg.get("debug_every", 1))) == 0)
+        v31a_data = None
+        v31a_xi_common = None
+        v31a_xi_geo = None
 
         if self.flow_mask:
             if self.save_results:
@@ -463,6 +482,51 @@ class FrontEnd(mp.Process):
                 if v30log:
                     v30_xi_refined = xi.detach().clone()
 
+                if v31a_log:
+                    # Shadow only: compute paired fits on exactly the same
+                    # finite, depth-restricted static input mask. The original
+                    # 'xi' above remains the ONLY one used for Tracking.
+                    with torch.no_grad():
+                        try:
+                            depth_min = float(v31acfg.get("min_depth", 0.10))
+                            depth_max = float(v31acfg.get("max_depth", 15.0))
+                            fitmask_a = (static_inliers_ds.bool()
+                                & torch.isfinite(depth_ds)
+                                & (depth_ds > depth_min) & (depth_ds < depth_max)
+                                & torch.isfinite(flow_px_ds).all(0))
+                            v31a_xi_common = fit_twist_weighted(
+                                depth_ds, flow_px_ds, Kds, fitmask_a,
+                                robust=True, iters=30).detach()
+                            v31a_xi_geo, v31a_fitdiag = fit_geometry_irls(
+                                depth_ds, flow_px_ds, Kds, fitmask_a, v31acfg)
+                            v31a_data = {
+                                "status": v31a_fitdiag["status"],
+                                "sample_count": int(v31a_fitdiag["n_points"]),
+                                "occupied_cells": int(v31a_fitdiag["occupied_cells"]),
+                                "condition": float(v31a_fitdiag["condition"]),
+                                "fit_mask_count": int(fitmask_a.sum().item()),
+                                "xi_legacy_actual": xi.detach().cpu().numpy(),
+                                "xi_legacy_common": v31a_xi_common.cpu().numpy(),
+                                "xi_geo": (v31a_xi_geo.detach().cpu().numpy()
+                                           if v31a_xi_geo is not None else
+                                           np.full((6,), np.nan, dtype=np.float32)),
+                            }
+                            if v31a_xi_geo is not None:
+                                v31a_data.update(compare_flow_residuals(
+                                    depth_ds, flow_px_ds, Kds, fitmask_a,
+                                    v31a_xi_common, v31a_xi_geo,
+                                    holdout_stride=int(v31acfg.get("sampling_stride", 4))))
+                        except (RuntimeError, ValueError) as e:
+                            # A failed shadow solve must NEVER replace the
+                            # primary camera estimator or abort tracking.
+                            v31a_data = {
+                                "status": "shadow_exception",
+                                "error_message": str(e)[:512],
+                                "xi_legacy_actual": xi.detach().cpu().numpy(),
+                            }
+                            v31a_xi_common = None
+                            v31a_xi_geo = None
+
                 rigid_flow_px = predict_rigid_flow_px(depth_ds, Kds, xi)
                 rigid_flow_out = pixels_to_flow_units(rigid_flow_px, H, W, mode='grid')
 
@@ -516,6 +580,27 @@ class FrontEnd(mp.Process):
 
                 viewpoint.R = T_curr[:3,:3]
                 viewpoint.T = T_curr[:3, 3]
+                if v31a_log and v31a_data is not None:
+                    # Construct hypothetical initial poses with *exactly the
+                    # legacy translation/rotation clipping rules*; do not
+                    # write these hypotheses to viewpoint.R/T.
+                    with torch.no_grad():
+                        v31a_data["T_previous_est"] = T_prev.detach().cpu().numpy()
+                        v31a_data["T_tracking_initial_actual"] = T_curr.detach().cpu().numpy()
+                        if v31a_xi_common is not None:
+                            v31a_data["T_candidate_legacy_common"] = candidate_initial_pose(
+                                T_prev, v31a_xi_common, max_translation, max_rot,
+                                translation_mode="legacy").detach().cpu().numpy()
+                        if v31a_xi_geo is not None:
+                            v31a_data["T_candidate_geo"] = candidate_initial_pose(
+                                T_prev, v31a_xi_geo, max_translation, max_rot,
+                                translation_mode="legacy").detach().cpu().numpy()
+                        if hasattr(prev, "R_gt") and hasattr(prev, "T_gt") and (
+                                hasattr(viewpoint, "R_gt") and hasattr(viewpoint, "T_gt")):
+                            v31a_data["T_previous_gt"] = rigid_transform(
+                                prev.R_gt, prev.T_gt).detach().cpu().numpy()
+                            v31a_data["T_current_gt"] = rigid_transform(
+                                viewpoint.R_gt, viewpoint.T_gt).detach().cpu().numpy()
                 if v31debug:
                     v31tracking_initial = rigid_transform(viewpoint.R, viewpoint.T).detach().cpu().numpy()
                     v31twist_first = results["xi"].detach().cpu().numpy()
@@ -959,6 +1044,25 @@ class FrontEnd(mp.Process):
                       diag31["first_fallback"], diag31["refit_fallback"],
                       diag31["first_samples"], diag31["refit_samples"],
                       diag31["first_condition"], diag31["refit_condition"]))
+
+        # V3.1a: comparison is diagnostic-only, never consumed by Tracking.
+        if v31a_log:
+            if v31a_data is None:
+                v31a_data = {"status": "shadow_not_executed"}
+            v31a_data["frame_id"] = int(viewpoint.uid)
+            v31a_data["T_tracking_optimized"] = rigid_transform(
+                viewpoint.R, viewpoint.T).detach().cpu().numpy()
+            np.savez_compressed(
+                os.path.join(output_dir,
+                             "camera_motion_v31a_{:05d}.npz".format(viewpoint.uid)),
+                **v31a_data)
+            print("[CIMD-V3.1a] frame={} status={} common={} holdout={} "
+                  "legacy_rmse={:.4f} geo_rmse={:.4f}".format(
+                      viewpoint.uid, v31a_data.get("status"),
+                      v31a_data.get("n_common", 0),
+                      v31a_data.get("n_holdout", 0),
+                      v31a_data.get("legacy_holdout_rmse_px", float("nan")),
+                      v31a_data.get("geo_holdout_rmse_px", float("nan"))))
 
         self.median_depth = get_median_depth(depth, opacity)
 
