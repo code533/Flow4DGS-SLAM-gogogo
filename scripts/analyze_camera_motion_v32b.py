@@ -6,7 +6,15 @@ not camera poses. No frontend/backend state is modified.
 """
 import argparse
 import csv
+import sys
 from pathlib import Path
+
+# Running this file as "python scripts/..." puts scripts/ rather than the
+# repository root at sys.path[0]. Add the root explicitly so project imports
+# (utils, RAFT, etc.) work regardless of PYTHONPATH/current shell setup.
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 import numpy as np
 
