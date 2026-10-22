@@ -1,7 +1,8 @@
 import unittest
 import numpy as np
 from utils.camera_motion_v32b import (exact_backward_gt_flow, gt_camera_twist,
-    jacobian_backward_flow, projected_depth_mask, flow_scores)
+    jacobian_backward_flow, projected_depth_mask, flow_scores,
+    remap_depth_to_rectified)
 
 
 class TestV32b(unittest.TestCase):
@@ -59,6 +60,15 @@ class TestV32b(unittest.TestCase):
         prev_depth=np.ones_like(self.depth)
         ok=projected_depth_mask(prev_depth,uv,zp,v,abs_tol=.01,rel_tol=0.)
         self.assertEqual(int(ok.sum()),0)
+
+    def test_depth_rectification_nearest_neighbor(self):
+        depth=np.arange(12,dtype=np.float32).reshape(3,4)
+        mx,my=np.meshgrid(np.arange(4,dtype=np.float32),
+                          np.arange(3,dtype=np.float32))
+        mx-=1
+        out=remap_depth_to_rectified(depth,mx,my)
+        self.assertEqual(float(out[1,2]),float(depth[1,1]))
+        self.assertEqual(float(out[1,0]),0.0)
 
     def test_score_perfect(self):
         a=np.ones((4,5,2));m=np.ones((4,5),dtype=bool)

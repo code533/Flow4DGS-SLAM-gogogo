@@ -124,6 +124,26 @@ def projected_depth_mask(previous_depth, projected_uv, projected_z,
             & (np.abs(observed-z)<=np.maximum(abs_tol,rel_tol*np.abs(z))))
 
 
+def remap_depth_to_rectified(depth, map_x, map_y):
+    """Remap RGB-registered depth to the rectified RGB pixel grid.
+
+    Bonn depth is registered to its corresponding raw RGB image. When RGB is
+    undistorted, apply the same inverse rectification maps to depth using
+    nearest-neighbor sampling so metric depths are not blended at edges.
+    Invalid/out-of-image pixels become 0.
+    """
+    import cv2
+    d = np.asarray(depth, dtype=np.float32)
+    mx = np.asarray(map_x, dtype=np.float32)
+    my = np.asarray(map_y, dtype=np.float32)
+    if d.ndim != 2 or mx.ndim != 2 or my.shape != mx.shape:
+        raise ValueError("Expected depth and two 2-D rectification maps")
+    if mx.shape != d.shape:
+        raise ValueError("Rectification maps and depth must share the output image size")
+    return cv2.remap(d, mx, my, interpolation=cv2.INTER_NEAREST,
+                     borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+
 def flow_scores(observed, reference, mask, min_magnitude_px=.3):
     """EPE, direction and polarity on the given region, without NaN leakage.
 

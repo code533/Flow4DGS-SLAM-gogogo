@@ -9,10 +9,13 @@ offline evaluation of the earlier CSV and not a new ATE experiment.
 
 1. Read actual Bonn balloon2 images, depth, and world-to-camera ground-truth
    poses with the existing TUM/Bonn timestamp association (`TUMParser`).
-2. Mirror the repo's camera RGB undistortion and **existing** raw depth loading.
-   **Important:** depth is not similarly remapped in the original
-   `MonocularDataset`, so RGB/depth misalignment near borders is a
-   possible source of error; keep original preprocessing for controlled replay.
+2. Undistort RGB with the repository calibration. Bonn documents that depth
+   is registered to its corresponding RGB image; therefore the diagnostic now
+   remaps depth and dataset masks with the same rectification maps (nearest
+   neighbor) by default so all pixel coordinates share the same grid. Use
+   `--depth-grid legacy` only to reproduce the previous diagnostic, which
+   undistorted RGB but left registered depth on the raw grid. Do not use the
+   legacy-grid output to make a final geometric sign conclusion.
 3. Run the repository RAFT checkpoint with **current RGB first, previous RGB
    second**, `iters=20`, and the exact InputPadder sequence used in
    `Camera.generate_flow`. `raw` is pixels; `tracking` is the effective
@@ -45,7 +48,8 @@ python scripts/analyze_camera_motion_v32b.py \
   --inherit-from configs/rgbd/bonn/config.yaml \
   --start 1 --step 10 --count 40 \
   --yolo 1 \
-  --output results/v32b_real_flow \
+  --depth-grid rectified \
+  --output results/v32b_real_flow_rectified \
   --save-maps
 ```
 
@@ -53,7 +57,12 @@ Requires local Bonn balloon2 dataset, `pretrained/raft-things.pth`,
 `pretrained/yolov9e-seg.pt`, CUDA/RAFT, PyTorch, NumPy, SciPy, OpenCV,
 Pillow, YAML, trimesh and the repository's installed dependencies.
 
-Use `--yolo 0` for a faster **mask-ablation** replay without detector masks
+The earlier CSV produced before the depth-grid correction is a legacy-grid
+diagnostic. Re-run into a new output directory (for example
+`results/v32b_real_flow_rectified`) before interpreting flow polarity.
+
+Use `--depth-grid legacy` to reproduce the old behavior for a controlled
+comparison. Use `--yolo 0` for a faster **mask-ablation** replay without detector masks
 (do not mix its results with the mask-enabled setting). To skip costly second
 IRLS replay, supply `--skip-original-fit`, but note that residual-mask and
 IRLS-sign metrics will then be absent.
@@ -90,8 +99,9 @@ IRLS-sign metrics will then be absent.
   diagnostic to match. This difference does not affect RAFT-vs-GT scoring.
 - GT assumes the existing Bonn `TUMParser` pose association is correct.
   Check frame indices and timestamps when discussing large direction errors.
-- Camera relative-flow comparisons depend on depth-camera and RGB-camera
-  alignment; raw depth is not remapped by the existing dataset loader.
+- The diagnostic rectifies depth and masks to the same pixel grid as RGB by
+  default. The `legacy` mode intentionally retains the original loader's
+  unremapped depth behavior and is not the preferred geometric reference.
 - No ATE result is claimed. CPU test coverage is synthetic; the user must
   run CUDA/RAFT with real Bonn data.
 

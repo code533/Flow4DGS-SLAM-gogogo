@@ -1,6 +1,8 @@
 """V3.2b: Replay real Bonn RGB-D + RAFT without launching SLAM.
 
 Reads the same TUM/Bonn timestamp associations and frontend RAFT checkpoint.
+Depth and masks are remapped with nearest-neighbor sampling onto the rectified
+RGB grid by default; --depth-grid legacy reproduces the earlier diagnostic.
 GT projects current depth into previous camera. Outputs per-frame diagnostics,
 not camera poses. No frontend/backend state is modified.
 """
@@ -20,25 +22,46 @@ import numpy as np
 
 from utils.camera_motion_v32b import (
     exact_backward_gt_flow, gt_camera_twist, jacobian_backward_flow,
-    projected_depth_mask, flow_scores,
+    projected_depth_mask, flow_scores, remap_depth_to_rectified,
 )
 
 
-def load_rgbd(parser, index, cfg, calibration):
-    """Mirror MonocularDataset RGB remapping and depth loading (not remapped)."""
+def rectification_maps(calibration):
+    """Return raw-to-rectified remap grids for the calibrated RGB image."""
+    if not calibration.get("distorted", False):
+        return None
+    import cv2
+    K = np.array([[calibration["fx"],0.,calibration["cx"]],
+                  [0.,calibration["fy"],calibration["cy"]],[0.,0.,1.]])
+    coeff=np.array([calibration["k1"],calibration["k2"],calibration["p1"],
+                    calibration["p2"],calibration["k3"]])
+    return cv2.initUndistortRectifyMap(
+        K,coeff,np.eye(3),K,
+        (int(calibration["width"]),int(calibration["height"])),cv2.CV_32FC1)
+
+
+def load_rgbd(parser, index, cfg, calibration, depth_grid="rectified", maps=None):
+    """Load RGB-D and keep depth on the same grid as the image used by RAFT.
+
+    The default rectified mode remaps RGB-registered depth with nearest-neighbor
+    sampling whenever RGB is undistorted. The legacy mode reproduces the
+    repository loader's historical behavior: undistort RGB, leave depth raw.
+    """
     import cv2
     from PIL import Image
     K = np.array([[calibration["fx"],0.,calibration["cx"]],
                   [0.,calibration["fy"],calibration["cy"]],[0.,0.,1.]])
     rgb = np.asarray(Image.open(parser.color_paths[index]).convert("RGB"))
-    if calibration.get("distorted", False):
-        coeff=np.array([calibration["k1"],calibration["k2"],calibration["p1"],
-                        calibration["p2"],calibration["k3"]])
-        mx,my = cv2.initUndistortRectifyMap(
-            K,coeff,np.eye(3),K,
-            (int(calibration["width"]),int(calibration["height"])),cv2.CV_32FC1)
-        rgb=cv2.remap(rgb,mx,my,cv2.INTER_LINEAR)
     depth=np.asarray(Image.open(parser.depth_paths[index]),dtype=np.float32) / float(calibration["depth_scale"])
+    if maps is None:
+        maps = rectification_maps(calibration)
+    if maps is not None:
+        mx,my=maps
+        rgb=cv2.remap(rgb,mx,my,cv2.INTER_LINEAR)
+        if depth_grid == "rectified":
+            depth=remap_depth_to_rectified(depth,mx,my)
+        elif depth_grid != "legacy":
+            raise ValueError("depth_grid must be 'rectified' or 'legacy'")
     pose=np.asarray(parser.poses[index],dtype=np.float64)
     if rgb.shape[:2]!=depth.shape:
         raise ValueError("RGB and depth sizes differ; project only aligned inputs")
@@ -47,14 +70,21 @@ def load_rgbd(parser, index, cfg, calibration):
     return rgb,depth,pose,K
 
 
-def static_prior(parser, index, rgb, yolo, cfg):
-    """Mirror the Bonn/TUM prior: mask file and optional YOLO class 0 + chair."""
+def static_prior(parser, index, rgb, yolo, cfg, maps=None):
+    """Build the dynamic prior in the same rectified pixel grid as RGB."""
+    import cv2
     from PIL import Image
     h,w=rgb.shape[:2]
     dynamic=np.zeros((h,w),dtype=bool)
     if parser.mask_path is not None:
-        mask_file=parser.mask_path[index]
-        dynamic|=(np.asarray(Image.open(mask_file).convert("L"),dtype=float)/255.>0.01)
+        # TUMParser.mask_paths follows its timestamp-associated/downsampled frames.
+        aligned_paths=getattr(parser,"mask_paths",[])
+        mask_file=aligned_paths[index] if len(aligned_paths)>index else parser.mask_path[index]
+        mask=np.asarray(Image.open(mask_file).convert("L"))
+        if maps is not None:
+            mask=cv2.remap(mask,maps[0],maps[1],cv2.INTER_NEAREST,
+                           borderMode=cv2.BORDER_CONSTANT,borderValue=0)
+        dynamic|=(mask.astype(float)/255.>0.01)
     if yolo is not None:
         import torch
         rgb_tensor=torch.from_numpy(np.ascontiguousarray(rgb)).to(device="cuda",dtype=torch.float32).permute(2,0,1)/255.
@@ -199,6 +229,8 @@ def main():
     p.add_argument("--yolo-checkpoint",default="pretrained/yolov9e-seg.pt")
     p.add_argument("--output",default="results/v32b_real_flow")
     p.add_argument("--save-maps",action="store_true")
+    p.add_argument("--depth-grid",choices=("rectified","legacy"),default="rectified",
+                   help="rectified aligns depth/masks with undistorted RGB; legacy reproduces old unremapped-depth diagnostic")
     p.add_argument("--skip-original-fit",action="store_true",help="Skip original flow residual segmentation/IRLS comparison")
     p.add_argument("--min-depth",type=float,default=0.1)
     p.add_argument("--max-depth",type=float,default=15.0)
@@ -226,16 +258,19 @@ def main():
         from ultralytics import YOLO
         yolo=YOLO(args.yolo_checkpoint)
     calib=cfg["Dataset"]["Calibration"]
+    maps=rectification_maps(calib)
     rows=[];failures=[]
     for i in selected:
         try:
-            rgb,depth,pose,K=load_rgbd(parser,i,cfg,calib)
-            prev_rgb,prev_depth,prev_pose,_=load_rgbd(parser,i-1,cfg,calib)
-            prior=static_prior(parser,i,rgb,yolo,cfg)
+            rgb,depth,pose,K=load_rgbd(parser,i,cfg,calib,args.depth_grid,maps)
+            prev_rgb,prev_depth,prev_pose,_=load_rgbd(parser,i-1,cfg,calib,args.depth_grid,maps)
+            prior=static_prior(parser,i,rgb,yolo,cfg,maps)
             row=summarize_frame(i,prior,rgb,prev_rgb,depth,prev_depth,
                 pose,prev_pose,K,model,cfg,out,args.min_depth,args.max_depth,
                 args.depth_abs_tol,args.depth_rel_tol,args.save_maps,
                 args.skip_original_fit,args.flow_direction_min_px)
+            row["depth_grid_mode"]=args.depth_grid
+            row["rgb_rectified"]=int(maps is not None)
             rows.append(row)
             score=row.get("occlusion_static_raft_vs_gt_median_epe_px",float("nan"))
             print(f"frame={i:04d} projected={row['valid_projected']} static={row['static_prior_count']} "
@@ -260,6 +295,7 @@ def main():
             a=a[np.isfinite(a)]
             if a.size:print(f" {k}: n={a.size}, median={np.median(a):.5f}, mean={np.mean(a):.5f}")
         print("Saved",out/"v32b_per_frame.csv")
+    print(f"depth_grid={args.depth_grid}, rgb_rectified={maps is not None}")
     print(f"selected={len(selected)}, success={len(rows)}, failed={len(failures)}")
     if failures:
         with (out/"failures.csv").open("w",newline="",encoding="utf-8") as f:
