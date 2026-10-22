@@ -125,7 +125,13 @@ def projected_depth_mask(previous_depth, projected_uv, projected_z,
 
 
 def flow_scores(observed, reference, mask, min_magnitude_px=.3):
-    """EPE, direction and polarity on the given region, without NaN leakage."""
+    """EPE, direction and polarity on the given region, without NaN leakage.
+
+    Direction angles use atan2(|2-D cross product|, dot product) rather than
+    arccos(cosine), which loses precision when the vectors are almost parallel
+    or antiparallel and can turn exact 0/180 degree cases into ~1e-6 degree
+    errors.
+    """
     observed=np.asarray(observed,dtype=np.float64)
     reference=np.asarray(reference,dtype=np.float64)
     mask=np.asarray(mask,dtype=bool)
@@ -147,8 +153,12 @@ def flow_scores(observed, reference, mask, min_magnitude_px=.3):
     strong=(norm_a>=min_magnitude_px)&(norm_b>=min_magnitude_px)
     out['valid_angles']=int(strong.sum())
     if strong.any():
-        cosine=np.clip(np.sum(a[strong]*b[strong],axis=1)/(norm_a[strong]*norm_b[strong]),-1.,1.)
-        out['mean_direction_deg']=float(np.degrees(np.arccos(cosine)).mean())
+        aa,bb=a[strong],b[strong]
+        dot=np.sum(aa*bb,axis=1)
+        cosine=np.clip(dot/(norm_a[strong]*norm_b[strong]),-1.,1.)
+        cross=np.abs(aa[:,0]*bb[:,1]-aa[:,1]*bb[:,0])
+        angles=np.degrees(np.arctan2(cross,dot))
+        out['mean_direction_deg']=float(angles.mean())
         out['negative_cosine_fraction']=float(np.mean(cosine<0))
         out['mean_cosine']=float(cosine.mean())
     return out

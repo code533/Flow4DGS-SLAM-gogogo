@@ -65,13 +65,13 @@ class TestV32b(unittest.TestCase):
         r=flow_scores(a,a,m)
         self.assertEqual(r['count'],20)
         self.assertAlmostEqual(r['rmse_epe_px'],0.)
-        self.assertAlmostEqual(r['mean_direction_deg'],0.)
+        self.assertAlmostEqual(r['mean_direction_deg'],0.,delta=1e-7)
 
     def test_score_opposite(self):
         a=np.ones((4,5,2));m=np.ones((4,5),dtype=bool)
         r=flow_scores(-a,a,m)
         self.assertAlmostEqual(r['negative_cosine_fraction'],1.)
-        self.assertAlmostEqual(r['mean_direction_deg'],180.)
+        self.assertAlmostEqual(r['mean_direction_deg'],180.,delta=1e-7)
 
     def test_score_empty(self):
         a=np.ones((4,5,2));m=np.zeros((4,5),dtype=bool)
