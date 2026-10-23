@@ -8,9 +8,14 @@ camera motion fitting and back-end dynamic Gaussian propagation/mapping.
 
 ## Run
 
-Use `configs/rgbd/bonn/ballon2_upslam_l1.yaml` following the repository's normal
-`python slam.py --config ...` command; consult `python slam.py --help` for
-the exact CLI supported by your checkout.
+Use `configs/rgbd/bonn/ballon2_upslam_l1.yaml` using:
+
+```bash
+python slam.py --config configs/rgbd/bonn/ballon2_upslam_l1.yaml --exp_name upslam_l1
+```
+
+For the baseline, switch `upslam_l1.enabled: false` and use a different
+`--exp_name`.
 
 For a controlled A/B comparison run the **same** config twice:
 - Baseline: set `model_params.upslam_l1.enabled: false`.
