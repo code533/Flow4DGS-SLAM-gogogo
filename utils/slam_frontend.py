@@ -20,6 +20,7 @@ import random
 from utils.slam_backend import segment_motion_parametric, fit_twist_weighted, pixels_to_flow_units, flow_to_pixels
 import torch.nn.functional as F
 from utils.pose_utils import SE3_exp, scale_se3_step, SO3_exp, so3_log
+from utils.upslam_mask import estimate_static_consistency_mask
 
 
 def flow_to_pixels(flow_norm, H, W, mode='grid'):
@@ -198,6 +199,8 @@ class FrontEnd(mp.Process):
         self.dynamic_model = config["model_params"].get("dynamic_model", False)
         self.insertion = config["model_params"].get("insertion", False)
         self.flow_mask = config["model_params"].get("flow_mask", False)
+        self.upslam_l1 = config["model_params"].get("upslam_l1", {})
+        self.upslam_l1_enabled = bool(self.upslam_l1.get("enabled", False))
         self.flow_cam = config["model_params"].get("flow_cam", False)
         self.flow_cam_thres = config["model_params"].get("flow_cam_thres", 5.0)
         self.flow_cam_maxt = config["model_params"].get("flow_cam_maxt", 0.01)
@@ -340,6 +343,39 @@ class FrontEnd(mp.Process):
         os.makedirs(output_dir, exist_ok=True)
         initial_motion_mask = viewpoint.motion_mask.clone()
 
+        if self.upslam_l1_enabled:
+            with torch.no_grad():
+                static_gaussians = (self.gaussians.dygs == False)
+                if bool(static_gaussians.any()):
+                    static_pkg = render(
+                        viewpoint, self.gaussians, self.pipeline_params,
+                        self.background, dynamic=False, mask=static_gaussians
+                    )
+                    upslam_static_mask, upslam_diag = estimate_static_consistency_mask(
+                        viewpoint, static_pkg, initial_motion_mask, self.upslam_l1
+                    )
+                    print(
+                        f"[UPSLAM-L1] frame={viewpoint.uid} "
+                        f"status={upslam_diag['status']} "
+                        f"coverage={upslam_diag['coverage']:.3f} "
+                        f"rejected={upslam_diag['dynamic_frac']:.3f}"
+                    )
+                    if self.upslam_l1.get("save_diagnostics", False):
+                        import numpy as _np
+                        _np.savez_compressed(
+                            os.path.join(output_dir, f"upslam_l1_{viewpoint.uid:05d}.npz"),
+                            rgb_err=upslam_diag["rgb_err"].detach().cpu().numpy(),
+                            depth_err=upslam_diag["depth_err"].detach().cpu().numpy(),
+                            valid=upslam_diag["valid"].detach().cpu().numpy(),
+                            candidate=upslam_diag["candidate"].detach().cpu().numpy(),
+                            final_static=upslam_static_mask.detach().cpu().numpy(),
+                            prior_static=initial_motion_mask.detach().cpu().numpy(),
+                            coverage=upslam_diag["coverage"],
+                            rejection_ratio=upslam_diag["dynamic_frac"],
+                            status=upslam_diag["status"],
+                        )
+                    viewpoint.motion_mask = upslam_static_mask
+
         if self.flow_mask:
             if self.save_results:
                 render_pkg = render(
@@ -362,7 +398,8 @@ class FrontEnd(mp.Process):
                                 )
             flow_mask = results['mask_bool']
             
-            viewpoint.motion_mask = viewpoint.motion_mask & (~flow_mask)
+            if not self.upslam_l1_enabled:
+                viewpoint.motion_mask = viewpoint.motion_mask & (~flow_mask)
 
             rigid_flow = results['rigid_flow_out'].permute(1,2,0)
 
@@ -387,7 +424,7 @@ class FrontEnd(mp.Process):
 
                 static_prior = initial_motion_mask.cuda().bool() if 'initial_motion_mask' in locals() else torch.ones_like(depth_valid, dtype=torch.bool)
 
-                static_from_residual = ~results['mask_bool']
+                static_from_residual = viewpoint.motion_mask.cuda().bool() if self.upslam_l1_enabled else ~results['mask_bool']
                 static_refit_mask = depth_valid & static_prior & static_from_residual  
                 valid_extent = static_refit_mask.sum().item() / static_refit_mask.numel()
                 static_inliers_ds = F.interpolate(static_refit_mask[None,None].float(), size=(H,W), mode='nearest').squeeze().bool()
@@ -459,7 +496,7 @@ class FrontEnd(mp.Process):
                 axes[1].axis("off")
 
                 axes[2].imshow(flow_mask.cpu().numpy(), cmap='gray')
-                axes[2].set_title("Refined Flow-based Motion Mask")
+                axes[2].set_title("Flow Residual (diagnostic only)" if self.upslam_l1_enabled else "Refined Flow-based Motion Mask")
                 axes[2].axis("off")
 
                 axes[3].imshow((~viewpoint.motion_mask).cpu().numpy(), cmap='gray')

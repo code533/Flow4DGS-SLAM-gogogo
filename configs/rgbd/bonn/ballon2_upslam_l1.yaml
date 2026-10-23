@@ -1,0 +1,23 @@
+# Standalone experiment config inheriting tracked Bonn default config.
+# For fair A/B runs, only toggle upslam_l1.enabled with all other settings fixed.
+inherit_from: "configs/rgbd/bonn/config.yaml"
+
+Dataset:
+  dataset_path: "datasets/bonn/rgbd_bonn_balloon2"
+
+model_params:
+  flow_mask: true
+  flow_cam: true
+  upslam_l1:
+    enabled: true
+    # L1 RGB-D residual fusion; train-free, not UP-SLAM DINO/MLP.
+    fusion: "and"
+    opacity_min: 0.95
+    depth_abs_threshold: 0.08
+    depth_rel_threshold: 0.04
+    rgb_threshold: 0.15
+    median_kernel: 5
+    min_valid_ratio: 0.05
+    min_valid_pixels: 256
+    max_dynamic_frac: 0.35
+    save_diagnostics: true
