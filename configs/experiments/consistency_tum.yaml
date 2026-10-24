@@ -1,0 +1,24 @@
+# Run from the repository root. No missing base_config.yaml dependency.
+inherit_from: configs/rgbd/tum/config.yaml
+
+Dataset:
+  dataset_path: datasets/tum/rgbd_dataset_freiburg3_walking_xyz
+  save_mask_overlays: false
+
+Results:
+  save_results: false
+  use_gui: false
+  use_wandb: false
+  eval_rendering: false
+
+StaticConsistency:
+  mode: observe
+  warmup_iterations: 10
+  opacity_min: 0.95
+  depth_min: 0.01
+  depth_abs_tolerance: 0.05
+  depth_rel_tolerance: 0.02
+  rgb_tolerance: 0.15
+  min_tracking_pixels: 256
+  min_tracking_fraction: 0.25
+  save_every: 30

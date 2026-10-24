@@ -334,7 +334,7 @@ class MonocularDataset(BaseDataset):
         )
         pose = torch.from_numpy(pose).to(device=self.device)
         mask_input = torch.zeros((image.shape[1], image.shape[2]), device=self.device, dtype=torch.bool)
-        if self.mask_paths:
+        if self.mask_paths and self.config["Dataset"].get("use_external_masks", True):
             mask_img = Image.open(self.mask_paths[idx]).convert("L")
             transform = transforms.Compose([
                 transforms.ToTensor(),
@@ -371,7 +371,7 @@ class MonocularDataset(BaseDataset):
 
 
         mask_path = color_path.replace('/rgb/', '/mask/')
-        if not os.path.exists(mask_path):
+        if self.config["Dataset"].get("save_mask_overlays", True) and not os.path.exists(mask_path):
             mask_folder = os.path.dirname(mask_path)
             if not os.path.exists(mask_folder):
                 os.makedirs(mask_folder)

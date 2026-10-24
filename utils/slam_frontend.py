@@ -1,4 +1,5 @@
 import time
+import json
 
 import numpy as np
 import torch
@@ -20,6 +21,7 @@ import random
 from utils.slam_backend import segment_motion_parametric, fit_twist_weighted, pixels_to_flow_units, flow_to_pixels
 import torch.nn.functional as F
 from utils.pose_utils import SE3_exp, scale_se3_step, SO3_exp, so3_log
+from utils.static_consistency import ConsistencyConfig, compute_evidence, select_tracking_mask
 
 
 def flow_to_pixels(flow_norm, H, W, mode='grid'):
@@ -202,6 +204,9 @@ class FrontEnd(mp.Process):
         self.flow_cam_thres = config["model_params"].get("flow_cam_thres", 5.0)
         self.flow_cam_maxt = config["model_params"].get("flow_cam_maxt", 0.01)
         self.flow_cam_maxr = config["model_params"].get("flow_cam_maxr", 0.1)
+        self.consistency = ConsistencyConfig(**config.get("StaticConsistency", {}))
+        if self.consistency.mode != "off" and self.monocular:
+            raise ValueError("StaticConsistency currently requires RGB-D input")
 
         self.dynamic_objects = 0
 
@@ -295,6 +300,40 @@ class FrontEnd(mp.Process):
 
             
 
+    @torch.no_grad()
+    def consistency_evidence(self, viewpoint, render_pkg, flow_dynamic, flow_valid):
+        image = torch.exp(viewpoint.exposure_a) * render_pkg["render"] + viewpoint.exposure_b
+        depth = torch.as_tensor(viewpoint.depth, device=image.device, dtype=image.dtype)
+        return compute_evidence(
+            viewpoint.original_image.to(image.device), depth, image,
+            render_pkg["depth"], render_pkg["opacity"], self.consistency,
+            flow_dynamic=flow_dynamic, flow_valid=flow_valid,
+        )
+
+    def save_consistency_evidence(self, viewpoint, evidence, tracking_info, flow_dynamic, flow_valid):
+        folder = os.path.join(self.save_dir, "static_consistency")
+        os.makedirs(folder, exist_ok=True)
+        state = evidence["state"]
+        summary = {
+            "frame": int(viewpoint.uid), "mode": self.consistency.mode,
+            "evaluation_pose": "after_tracking",
+            "map_valid_fraction": evidence["map_valid"].float().mean().item(),
+            "map_inconsistent_fraction": evidence["map_inconsistent"].float().mean().item(),
+            "unknown_fraction": (state == 0).float().mean().item(),
+            "static_fraction": (state == 1).float().mean().item(),
+            "dynamic_candidate_fraction": (state == 2).float().mean().item(),
+            **tracking_info,
+        }
+        with open(os.path.join(folder, "summary.jsonl"), "a") as stream:
+            stream.write(json.dumps(summary, allow_nan=False) + "\n")
+        if self.consistency.save_every and viewpoint.uid % self.consistency.save_every == 0:
+            arrays = {key: value.detach().cpu().numpy() for key, value in evidence.items()}
+            arrays["baseline_static_mask"] = viewpoint.motion_mask.detach().cpu().numpy()
+            if flow_dynamic is not None:
+                arrays["flow_dynamic"] = flow_dynamic.detach().cpu().numpy()
+                arrays["flow_valid"] = flow_valid.detach().cpu().numpy()
+            np.savez_compressed(os.path.join(folder, f"{viewpoint.uid:06d}.npz"), **arrays)
+
     def tracking(self, cur_frame_idx, viewpoint, last_keyframe_idx):
         start_time = time.time()
         prev = self.cameras[cur_frame_idx - self.use_every_n_frames]
@@ -339,6 +378,11 @@ class FrontEnd(mp.Process):
         output_dir = os.path.join(self.config["Results"]["save_dir"], "tracking")
         os.makedirs(output_dir, exist_ok=True)
         initial_motion_mask = viewpoint.motion_mask.clone()
+        consistency_flow_dynamic, consistency_flow_valid = None, None
+        consistency_keep = None
+        consistency_evaluated = False
+        consistency_info = {"mask_applied": False}
+        consistency_iteration = min(self.consistency.warmup_iterations, self.tracking_itr_num - 1)
 
         if self.flow_mask:
             if self.save_results:
@@ -361,6 +405,15 @@ class FrontEnd(mp.Process):
                                     motion_mask=viewpoint.motion_mask.cuda()
                                 )
             flow_mask = results['mask_bool']
+            if self.consistency.mode != "off":
+                # The original fitter zeroes residuals outside its semantic/depth
+                # support. Those zeros must not become static flow evidence.
+                consistency_flow_dynamic = flow_mask.detach()
+                consistency_flow_valid = (
+                    initial_motion_mask.bool() & torch.isfinite(depth_tensor)
+                    & (depth_tensor > 0) & torch.isfinite(flow_back).all(dim=-1)
+                    & torch.isfinite(results['resid_px'])
+                )
             
             viewpoint.motion_mask = viewpoint.motion_mask & (~flow_mask)
 
@@ -490,6 +543,21 @@ class FrontEnd(mp.Process):
                 else:
                     mask = None
 
+                if self.consistency.mode == "tracking" and tracking_itr == consistency_iteration:
+                    evidence = self.consistency_evidence(
+                        viewpoint, render_pkg, consistency_flow_dynamic, consistency_flow_valid)
+                    gt_depth = torch.as_tensor(viewpoint.depth, device=depth.device)
+                    support = viewpoint.motion_mask.bool() & torch.isfinite(gt_depth)
+                    support &= (gt_depth > 0.01) & (gt_depth < 1000) & (opacity.reshape_as(gt_depth) > 0.95)
+                    support &= viewpoint.grad_mask.reshape_as(gt_depth).bool()
+                    support &= viewpoint.original_image.sum(dim=0) > self.config["Training"]["rgb_boundary_threshold"]
+                    consistency_keep, consistency_info = select_tracking_mask(
+                        evidence, support, self.consistency)
+                    consistency_info["mask_iteration"] = tracking_itr
+                    consistency_evaluated = True
+                if consistency_keep is not None:
+                    mask = consistency_keep if mask is None else mask & consistency_keep
+
 
             loss_tracking = get_loss_tracking(
                 self.config, 
@@ -518,10 +586,24 @@ class FrontEnd(mp.Process):
                 self.gaussians.optimizer.zero_grad(set_to_none=True)
                 converged = update_pose(viewpoint)
 
-            if converged:
+            if converged and (self.consistency.mode != "tracking" or consistency_evaluated):
                 break
 
         self.median_depth = get_median_depth(depth, opacity)
+
+        if self.consistency.mode != "off":
+            # Re-render at the updated pose using only the historical static map.
+            # Observe mode never changes the optimizer, mask, or stopping rule.
+            with torch.no_grad():
+                static_pkg = render(
+                    viewpoint, self.gaussians, self.pipeline_params, self.background,
+                    dynamic=False, dx=dxyz, ds=d_scale, dr=d_rot,
+                    mask=(self.gaussians.dygs == False))
+                evidence = self.consistency_evidence(
+                    viewpoint, static_pkg, consistency_flow_dynamic, consistency_flow_valid)
+                self.save_consistency_evidence(
+                    viewpoint, evidence, consistency_info,
+                    consistency_flow_dynamic, consistency_flow_valid)
 
         
         

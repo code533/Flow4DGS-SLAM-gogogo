@@ -1,6 +1,7 @@
 import os
 import sys, io, re
 import time
+import random
 from argparse import ArgumentParser
 from datetime import datetime
 import numpy as np
@@ -25,7 +26,6 @@ from utils.slam_frontend import FrontEnd
 from arguments import ModelHiddenParams
 from argparse import ArgumentParser, Namespace
 
-from ultralytics import YOLO
 from contextlib import redirect_stdout, redirect_stderr
 
 
@@ -117,6 +117,7 @@ class SLAM:
                 
                 #load the YOLO model
                 if config['yolo']:
+                    from ultralytics import YOLO
                     self.dataset.yolo_model = YOLO('pretrained/yolov9e-seg.pt')
                 print("dataset length: ", len(self.dataset))
                 
@@ -336,7 +337,12 @@ if __name__ == "__main__":
     parser.add_argument("--config", type=str)
     parser.add_argument("--eval", action="store_true")
     parser.add_argument("--dynamic", action="store_true", default=False)  # 4D dynamic
-    parser.add_argument("--yolo", type=int, default=1)  # 4D dynamic
+    parser.add_argument("--yolo", type=int, choices=[0, 1], default=None)
+    parser.add_argument("--consistency-mode", choices=["off", "observe", "tracking"], default=None)
+    parser.add_argument("--no-semantic-masks", action="store_true",
+                        help="Disable YOLO and external dataset masks (experimental)")
+    parser.add_argument("--seed", type=int, default=None,
+                        help="Seed the main process; CUDA/multiprocessing may remain nondeterministic")
     parser.add_argument('--interval', type=int, default=50)
     parser.add_argument('--iters', type=int, default=50)
     parser.add_argument('--exp_name', type=str, default='')
@@ -353,7 +359,23 @@ if __name__ == "__main__":
         config = yaml.safe_load(yml)
 
     config = load_config(args.config, inherit_from=args.inherit_from)
-    config['yolo'] = bool(args.yolo)
+    if args.seed is not None:
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        torch.cuda.manual_seed_all(args.seed)
+        config["experiment_seed"] = args.seed
+    config['yolo'] = bool(args.yolo) if args.yolo is not None else bool(config.get('yolo', True))
+    if args.consistency_mode is not None:
+        config.setdefault("StaticConsistency", {})["mode"] = args.consistency_mode
+    if args.no_semantic_masks:
+        if args.yolo == 1:
+            parser.error("--no-semantic-masks conflicts with --yolo 1")
+        if config["Dataset"]["type"] != "tum":
+            parser.error("--no-semantic-masks is currently supported for TUM/Bonn RGB-D only")
+        config['yolo'] = False
+        config["Dataset"]["use_external_masks"] = False
+        config["Dataset"]["save_mask_overlays"] = False
     save_dir = None
 
     if args.eval:

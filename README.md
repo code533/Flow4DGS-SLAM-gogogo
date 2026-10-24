@@ -103,6 +103,13 @@ bash scripts/train_bonn.sh
 
 
 
+## Static-consistency research prototype
+
+See [the research plan and experiment commands](docs/RESEARCH_PLAN.md) for the
+optional RGB-D consistency diagnostics, tracking-only filtering, and semantic-mask
+ablations. The original mode remains the default. This prototype has CPU tests;
+full GPU SLAM accuracy and runtime have not yet been evaluated.
+
 # 5.Acknowledgement
 This work incorporates many open-source codes. We extend our gratitude to the authors of the software.
 - [4DGS-SLAM](https://github.com/yanyan-li/4DGS-SLAM)
