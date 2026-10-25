@@ -1,0 +1,4 @@
+inherit_from: configs/experiments/b1_short.yaml
+StaticConsistency:
+  mode: tracking
+  depth_definition: accumulated

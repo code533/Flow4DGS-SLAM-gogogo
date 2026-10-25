@@ -16,6 +16,7 @@ UNKNOWN, STATIC, DYNAMIC = 0, 1, 2
 @dataclass(frozen=True)
 class ConsistencyConfig:
     mode: str = "off"  # off | observe | tracking
+    depth_definition: str = "normalized"  # preserve the original detector default
     warmup_iterations: int = 10
     opacity_min: float = 0.95
     depth_min: float = 0.01
@@ -29,6 +30,8 @@ class ConsistencyConfig:
     def __post_init__(self):
         if self.mode not in ("off", "observe", "tracking"):
             raise ValueError("StaticConsistency.mode must be off, observe or tracking")
+        if self.depth_definition not in ("accumulated", "normalized"):
+            raise ValueError("depth_definition must be accumulated or normalized")
         for name in ("warmup_iterations", "save_every", "min_tracking_pixels"):
             value = getattr(self, name)
             if isinstance(value, bool) or not isinstance(value, int) or value < 0:
@@ -51,7 +54,8 @@ def compute_evidence(observed_rgb, observed_depth, rendered_rgb, accumulated_dep
     """Compute detached evidence on the input device.
 
 The repository rasterizer returns sum(alpha * transmittance * z), NOT
-normalized surface depth. Divide by accumulated opacity for this detector only.
+normalized surface depth. The detector selects a definition without changing losses.
+Validity uses normalized depth in both modes to keep paired support identical.
 RGB must already use the same exposure correction as the tracking loss.
 Flow inputs, if supplied, must be aligned to this frame and provided together.
 """
@@ -79,7 +83,8 @@ Flow inputs, if supplied, must be aligned to this frame and provided together.
     map_valid &= (predicted_depth > config.depth_min) & torch.isfinite(rendered_rgb).all(dim=0)
 
     # Positive signed residual = current surface is in front of the map.
-    signed_depth = predicted_depth - observed_depth
+    selected_depth = raw_depth if config.depth_definition == "accumulated" else predicted_depth
+    signed_depth = selected_depth - observed_depth
     tolerance = config.depth_abs_tolerance + config.depth_rel_tolerance * observed_depth
     depth_score = signed_depth.abs() / tolerance.clamp_min(1e-6)
     rgb_score = (observed_rgb - rendered_rgb).abs().mean(dim=0) / config.rgb_tolerance
@@ -111,6 +116,19 @@ Flow inputs, if supplied, must be aligned to this frame and provided together.
         "revealed_candidate": revealed,
         "depth_score": torch.where(map_valid, depth_score, nan),
         "rgb_score": torch.where(map_valid, rgb_score, nan),
+        # Preserve raw diagnostics outside map_valid for offline validity audits.
+        # Depths/residuals are in metres; opacity is dimensionless. Consumers
+        # must apply validity masks before interpreting residuals.
+        "observed_depth": observed_depth.detach(),
+        "accumulated_depth": raw_depth.detach(),
+        "render_opacity": alpha.detach(),
+        "normalized_depth": predicted_depth.detach(),
+        "depth_tolerance": tolerance.detach(),
+        "observation_valid": observation_valid.detach(),
+        # Positive means rendered depth is farther than the observation.
+        # Include subthreshold residuals, not just detected anomalies.
+        "signed_depth_accumulated": (raw_depth - observed_depth).detach(),
+        "signed_depth_normalized": (predicted_depth - observed_depth).detach(),
     }
 
 
@@ -129,5 +147,46 @@ NOT a dynamic assignment mask and must not overwrite Camera.motion_mask.
     return (keep if accepted else None), {
         "baseline_support_pixels": before,
         "retained_support_pixels": after,
+        "candidate_excluded_pixels": before - after,
+        "candidate_excluded_fraction": (before - after) / before if before else None,
+        "applied_retained_support_pixels": after if accepted else before,
+        "applied_excluded_pixels": before - after if accepted else 0,
+        "fallback": not accepted,
+        "fallback_reason": (None if accepted else "empty_support" if before == 0
+                            else "minimum_pixels" if after < config.min_tracking_pixels
+                            else "minimum_fraction"),
         "mask_applied": accepted,
     }
+
+
+@torch.no_grad()
+def tracking_supports(observed_rgb, observed_depth, opacity, grad_mask,
+                      motion_mask, rgb_threshold, frame_id):
+    """Mirror RGB-D tracking loss masks before the extra consistency mask.
+
+    RGB is opacity-weighted but has no opacity cutoff; depth has no gradient mask.
+    Counts describe selected pixels, not gradient magnitude or pose information.
+    """
+    shape = observed_depth.shape
+    baseline = torch.ones_like(observed_depth, dtype=torch.bool)
+    if motion_mask is not None and frame_id > 0:
+        baseline &= motion_mask.reshape(shape).bool()
+    rgb = baseline & (observed_rgb.sum(dim=0) > rgb_threshold) & grad_mask.reshape(shape).bool()
+    depth = baseline & (observed_depth > 0.01) & (observed_depth < 1000)
+    depth &= opacity.reshape(shape) > 0.95
+    return {"rgb": rgb, "depth": depth, "union": rgb | depth}
+
+
+@torch.no_grad()
+def tracking_support_statistics(evidence, supports, applied_keep):
+    result = {}
+    candidate_keep = ~evidence["map_inconsistent"]
+    for name, support in supports.items():
+        before = int(support.count_nonzero().item())
+        candidate = int((support & candidate_keep).count_nonzero().item())
+        after = int((support & applied_keep).count_nonzero().item()) if applied_keep is not None else before
+        result.update({f"{name}_support_pixels": before,
+                       f"{name}_candidate_retained_pixels": candidate,
+                       f"{name}_applied_retained_pixels": after,
+                       f"{name}_applied_excluded_fraction": (before-after)/before if before else None})
+    return result

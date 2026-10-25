@@ -13,6 +13,7 @@ Results:
 
 StaticConsistency:
   mode: observe
+  depth_definition: normalized
   warmup_iterations: 10
   opacity_min: 0.95
   depth_min: 0.01

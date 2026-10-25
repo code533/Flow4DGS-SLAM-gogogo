@@ -21,7 +21,7 @@ import random
 from utils.slam_backend import segment_motion_parametric, fit_twist_weighted, pixels_to_flow_units, flow_to_pixels
 import torch.nn.functional as F
 from utils.pose_utils import SE3_exp, scale_se3_step, SO3_exp, so3_log
-from utils.static_consistency import ConsistencyConfig, compute_evidence, select_tracking_mask
+from utils.static_consistency import ConsistencyConfig, compute_evidence, select_tracking_mask, tracking_supports, tracking_support_statistics
 
 
 def flow_to_pixels(flow_norm, H, W, mode='grid'):
@@ -316,6 +316,7 @@ class FrontEnd(mp.Process):
         state = evidence["state"]
         summary = {
             "frame": int(viewpoint.uid), "mode": self.consistency.mode,
+            "depth_definition": self.consistency.depth_definition,
             "evaluation_pose": "after_tracking",
             "map_valid_fraction": evidence["map_valid"].float().mean().item(),
             "map_inconsistent_fraction": evidence["map_inconsistent"].float().mean().item(),
@@ -547,12 +548,13 @@ class FrontEnd(mp.Process):
                     evidence = self.consistency_evidence(
                         viewpoint, render_pkg, consistency_flow_dynamic, consistency_flow_valid)
                     gt_depth = torch.as_tensor(viewpoint.depth, device=depth.device)
-                    support = viewpoint.motion_mask.bool() & torch.isfinite(gt_depth)
-                    support &= (gt_depth > 0.01) & (gt_depth < 1000) & (opacity.reshape_as(gt_depth) > 0.95)
-                    support &= viewpoint.grad_mask.reshape_as(gt_depth).bool()
-                    support &= viewpoint.original_image.sum(dim=0) > self.config["Training"]["rgb_boundary_threshold"]
+                    supports = tracking_supports(
+                        viewpoint.original_image, gt_depth, opacity, viewpoint.grad_mask,
+                        viewpoint.motion_mask, self.config["Training"]["rgb_boundary_threshold"], viewpoint.uid)
                     consistency_keep, consistency_info = select_tracking_mask(
-                        evidence, support, self.consistency)
+                        evidence, supports["union"], self.consistency)
+                    consistency_info.update(tracking_support_statistics(evidence, supports, consistency_keep))
+                    consistency_info["support_evaluation_pose"] = "before_mask_iteration_update"
                     consistency_info["mask_iteration"] = tracking_itr
                     consistency_evaluated = True
                 if consistency_keep is not None:
@@ -601,6 +603,14 @@ class FrontEnd(mp.Process):
                     mask=(self.gaussians.dygs == False))
                 evidence = self.consistency_evidence(
                     viewpoint, static_pkg, consistency_flow_dynamic, consistency_flow_valid)
+                if self.consistency.mode == "observe":
+                    supports = tracking_supports(
+                        viewpoint.original_image, torch.as_tensor(viewpoint.depth, device=static_pkg["depth"].device),
+                        static_pkg["opacity"], viewpoint.grad_mask, viewpoint.motion_mask,
+                        self.config["Training"]["rgb_boundary_threshold"], viewpoint.uid)
+                    consistency_info.update(tracking_support_statistics(evidence, supports, None))
+                    consistency_info["support_evaluation_pose"] = "after_tracking"
+                consistency_info["tracking_iterations"] = tracking_itr + 1
                 self.save_consistency_evidence(
                     viewpoint, evidence, consistency_info,
                     consistency_flow_dynamic, consistency_flow_valid)

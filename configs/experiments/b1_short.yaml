@@ -1,0 +1,11 @@
+# Common short-run control; use the same seed and dataset for all variants.
+inherit_from: configs/experiments/consistency_tum.yaml
+yolo: true
+Dataset:
+  Calibration:
+    start: 0
+    end: 100
+StaticConsistency:
+  mode: observe
+  depth_definition: normalized
+  save_every: 10

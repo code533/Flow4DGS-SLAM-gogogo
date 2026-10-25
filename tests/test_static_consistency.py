@@ -4,6 +4,7 @@ import torch
 
 from utils.static_consistency import (
     ConsistencyConfig, DYNAMIC, STATIC, UNKNOWN, compute_evidence, select_tracking_mask,
+    tracking_supports, tracking_support_statistics,
 )
 
 
@@ -21,6 +22,52 @@ class StaticConsistencyTests(unittest.TestCase):
             self.z[None] if raw is None else raw,
             self.alpha if alpha is None else alpha, self.cfg, **kwargs,
         )
+
+    def test_definition_switch_changes_only_selected_evidence(self):
+        raw = torch.full_like(self.z[None], 3.0)
+        observed = torch.full_like(self.z, 3.0)
+        alpha = self.alpha * 0.96
+        norm = self.evidence(raw=raw, observed=observed, alpha=alpha)
+        self.cfg = ConsistencyConfig(depth_definition="accumulated")
+        acc = self.evidence(raw=raw, observed=observed, alpha=alpha)
+        self.assertTrue(norm["map_inconsistent"].all())
+        self.assertFalse(acc["map_inconsistent"].any())
+        self.assertTrue(torch.equal(norm["map_valid"], acc["map_valid"]))
+        for key in ["observed_depth", "accumulated_depth", "normalized_depth",
+                    "render_opacity", "signed_depth_accumulated", "signed_depth_normalized"]:
+            self.assertTrue(torch.equal(norm[key], acc[key]), key)
+        with self.assertRaises(ValueError):
+            ConsistencyConfig(depth_definition="typo")
+
+    def test_supports_match_distinct_loss_masks(self):
+        grad = torch.ones_like(self.z, dtype=torch.bool)
+        grad[0, 0] = False
+        alpha = self.alpha.clone()
+        alpha[0, 0, 1] = 0.5
+        motion = torch.ones_like(grad)
+        motion[0, 2] = False
+        supports = tracking_supports(self.rgb, self.z, alpha, grad, motion, 0.01, 1)
+        self.assertFalse(supports["rgb"][0, 0])
+        self.assertTrue(supports["depth"][0, 0])
+        self.assertTrue(supports["rgb"][0, 1])
+        self.assertFalse(supports["depth"][0, 1])
+        self.assertFalse(supports["union"][0, 2])
+        self.assertEqual(int(supports["union"].sum()), 19)
+
+    def test_fallback_reports_actual_retention(self):
+        evidence = self.evidence(observed=self.z + 1)
+        support = torch.ones_like(self.z, dtype=torch.bool)
+        keep, info = select_tracking_mask(evidence, support, self.cfg)
+        self.assertIsNone(keep)
+        self.assertEqual(info["candidate_excluded_pixels"], 20)
+        self.assertEqual(info["applied_excluded_pixels"], 0)
+        stats = tracking_support_statistics(evidence, {"union": support}, keep)
+        self.assertEqual(stats["union_applied_retained_pixels"], 20)
+        self.assertEqual(stats["union_candidate_retained_pixels"], 0)
+        empty = torch.zeros_like(support)
+        _, info = select_tracking_mask(evidence, empty, self.cfg)
+        self.assertIsNone(info["candidate_excluded_fraction"])
+        self.assertEqual(info["fallback_reason"], "empty_support")
 
     def test_matching_surface_is_static(self):
         self.assertTrue((self.evidence()["state"] == STATIC).all())
