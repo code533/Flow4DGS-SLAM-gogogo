@@ -92,3 +92,29 @@ Saving synchronizes tensors to CPU and compresses files inside tracking, so
 reported tracking time includes diagnostic I/O. Use recording-disabled runs for
 runtime benchmarks. No loss, threshold, mask-selection or stopping rule changes
 are introduced by this recorder. Full SLAM validation remains a server task.
+
+## Compact server-side decision report
+
+Run after a diagnostic tracking run completes (numpy, Pillow, matplotlib, PyYAML;
+no Torch/CUDA or original dataset needed):
+
+```bash
+python scripts/analyze_tracking_decisions.py \
+  --results /path/to/B2_norm_seed1_run \
+  --output /path/to/new_seed1_analysis
+```
+
+Run separately for seed 2. Send only each output's `analysis_report.zip`.
+The output directory must not already exist. Keep `visualize_consistency.py`
+beside the new script: it supplies the shared depth-region definition.
+
+The report validates NPZ masks against decision-time JSONL, reports frame-wise
+RGB/depth/union removal, pools counts, and exports fixed 4x4 spatial cell counts.
+Dense snapshots additionally yield depth-region counts and RGB overlays (default
+frames 10,50,90; override with `--plot-frames 20 60`). Missing dense plot frames
+are reported, never substituted silently. Region statistics use dense frames
+only and include invalid sensor depth so RGB support is fully accounted for.
+ATE statistics are collected from stats_final.json files under the run directory;
+if absent the report explicitly requests them separately. This script does not
+compute framewise trajectory error or RPE. Mask coverage does not quantify pose
+observability. Runtime includes the earlier recorder overhead.
