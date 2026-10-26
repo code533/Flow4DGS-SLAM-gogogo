@@ -66,6 +66,12 @@ Training:
   window_size: 8
   stop_xyz_grad: true
 model_params:
+  # V4.0 observation-only, OFF by default. Logs static-only pre/post residuals.
+  v40_diagnostics:
+    enabled: false
+    every: 10
+    opacity_min: 0.95
+    save_maps: true
   data_device: cuda
   dynamic_model: offset
   # Optional V2: conservative flow + static RGB-D residual fusion for Tracking.
