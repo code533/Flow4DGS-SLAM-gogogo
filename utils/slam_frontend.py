@@ -21,7 +21,7 @@ import random
 from utils.slam_backend import segment_motion_parametric, fit_twist_weighted, pixels_to_flow_units, flow_to_pixels
 import torch.nn.functional as F
 from utils.pose_utils import SE3_exp, scale_se3_step, SO3_exp, so3_log
-from utils.static_consistency import ConsistencyConfig, compute_evidence, select_tracking_mask, tracking_supports, tracking_support_statistics, save_tracking_decision
+from utils.static_consistency import ConsistencyConfig, compute_evidence, select_tracking_mask, tracking_supports, tracking_support_statistics, save_tracking_decision, select_tracking_weights
 
 
 def flow_to_pixels(flow_norm, H, W, mode='grid'):
@@ -381,6 +381,7 @@ class FrontEnd(mp.Process):
         initial_motion_mask = viewpoint.motion_mask.clone()
         consistency_flow_dynamic, consistency_flow_valid = None, None
         consistency_keep = None
+        consistency_weights = None
         consistency_evaluated = False
         consistency_info = {"mask_applied": False}
         consistency_iteration = min(self.consistency.warmup_iterations, self.tracking_itr_num - 1)
@@ -551,19 +552,19 @@ class FrontEnd(mp.Process):
                     supports = tracking_supports(
                         viewpoint.original_image, gt_depth, opacity, viewpoint.grad_mask,
                         viewpoint.motion_mask, self.config["Training"]["rgb_boundary_threshold"], viewpoint.uid)
-                    consistency_keep, consistency_info = select_tracking_mask(
-                        evidence, supports["union"], self.consistency)
-                    consistency_info.update(tracking_support_statistics(evidence, supports, consistency_keep))
+                    consistency_weights, consistency_info = select_tracking_weights(
+                        evidence, supports, self.consistency)
+                    consistency_keep = consistency_weights > 0
                     consistency_info["support_evaluation_pose"] = "before_mask_iteration_update"
                     consistency_info["mask_iteration"] = tracking_itr
                     save_tracking_decision(
                         os.path.join(self.save_dir, "tracking_decisions"),
                         int(viewpoint.uid), tracking_itr, evidence, supports, consistency_keep,
                         consistency_info, self.consistency, viewpoint.original_image,
-                        viewpoint.R, viewpoint.T)
+                        viewpoint.R, viewpoint.T, weights=consistency_weights)
                     consistency_evaluated = True
-                if consistency_keep is not None:
-                    mask = consistency_keep if mask is None else mask & consistency_keep
+                if consistency_weights is not None:
+                    mask = consistency_weights if mask is None else mask * consistency_weights
 
 
             loss_tracking = get_loss_tracking(

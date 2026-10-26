@@ -1,0 +1,3 @@
+inherit_from: configs/experiments/b2_norm_short.yaml
+StaticConsistency:
+  inconsistent_weight: 0.5

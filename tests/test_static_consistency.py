@@ -4,7 +4,7 @@ import torch
 
 from utils.static_consistency import (
     ConsistencyConfig, DYNAMIC, STATIC, UNKNOWN, compute_evidence, select_tracking_mask,
-    tracking_supports, tracking_support_statistics, save_tracking_decision,
+    tracking_supports, tracking_support_statistics, save_tracking_decision, select_tracking_weights,
 )
 
 
@@ -109,6 +109,58 @@ class StaticConsistencyTests(unittest.TestCase):
             self.assertFalse(disabled.exists())
         for k in evidence:
             self.assertTrue(torch.allclose(evidence[k], original[k], equal_nan=True), k)
+
+    def test_soft_weights_endpoints_and_fallback(self):
+        rendered = self.rgb.clone()
+        rendered[:, 0, 0] = 1.0
+        evidence = self.evidence(rendered=rendered)
+        supports = {k: torch.ones_like(self.z, dtype=torch.bool) for k in ["rgb", "depth", "union"]}
+        for weight in [0.0, 0.5, 1.0]:
+            cfg = ConsistencyConfig(inconsistent_weight=weight, min_tracking_pixels=1)
+            weights, info = select_tracking_weights(evidence, supports, cfg)
+            self.assertEqual(weights[0, 0].item(), weight)
+            self.assertEqual(weights[1, 0].item(), 1)
+            self.assertEqual(info["applied_excluded_pixels"], int(weight == 0))
+            self.assertEqual(info["union_weight_sum"], 19 + weight)
+            self.assertEqual(info["mask_applied"], weight < 1)
+            weights, info = select_tracking_weights(self.evidence(observed=self.z+1), supports, cfg)
+            self.assertTrue(weights.eq(1).all())
+            self.assertTrue(info["fallback"])
+        for weight in [-1, 1.1, float("nan")]:
+            with self.assertRaises(ValueError):
+                ConsistencyConfig(inconsistent_weight=weight)
+
+    def test_existing_rgbd_loss_weights_linearly_and_preserves_gradient(self):
+        # Execute the actual loss function definitions on CPU, without importing
+        # optional plotting dependencies or changing production CUDA handling.
+        import ast
+        import tempfile
+        import os
+        from pathlib import Path
+        from types import SimpleNamespace
+        from unittest.mock import patch
+        source = Path(__file__).resolve().parents[1] / "utils/slam_utils.py"
+        module = ast.parse(source.read_text())
+        funcs = [n for n in module.body if isinstance(n, ast.FunctionDef)
+                 and n.name in ["get_loss_tracking_rgb", "get_loss_tracking_rgbd"]]
+        scope = {"torch": torch, "os": os}
+        exec(compile(ast.Module(body=funcs, type_ignores=[]), str(source), "exec"), scope)
+        camera = SimpleNamespace(original_image=self.rgb, depth=self.z.numpy(),
+                                 grad_mask=torch.ones_like(self.alpha, dtype=torch.bool),
+                                 motion_mask=torch.ones_like(self.z, dtype=torch.bool), uid=1)
+        with tempfile.TemporaryDirectory() as tmp, patch.object(torch.Tensor, "cuda", lambda x: x):
+            cfg = {"Results": {"save_dir": tmp}, "Training": {"alpha": 0.9, "rgb_boundary_threshold": 0.01}}
+            losses, grads = [], []
+            for weight in [0.0, 0.5, 1.0]:
+                image = (self.rgb + .2).requires_grad_()
+                depth = (self.z[None] + .3).requires_grad_()
+                loss = scope["get_loss_tracking_rgbd"](cfg, image, depth, self.alpha,
+                    camera, rm_dynamic=True, mask=torch.full_like(self.z, weight))
+                loss.backward()
+                losses.append(loss.item()); grads.append(image.grad.clone())
+            self.assertEqual(losses[0], 0)
+            self.assertAlmostEqual(losses[1], losses[2] * .5, places=6)
+            self.assertTrue(torch.allclose(grads[1], grads[2] * .5))
 
     def test_matching_surface_is_static(self):
         self.assertTrue((self.evidence()["state"] == STATIC).all())

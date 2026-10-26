@@ -118,3 +118,42 @@ ATE statistics are collected from stats_final.json files under the run directory
 if absent the report explicitly requests them separately. This script does not
 compute framewise trajectory error or RPE. Mask coverage does not quantify pose
 observability. Runtime includes the earlier recorder overhead.
+
+## B3 soft-weight comparison
+
+Three configurations inherit B2-norm with identical thresholds, warmup, stopping
+policy and diagnostic settings. Only `StaticConsistency.inconsistent_weight`
+differs (default 0 preserves old hard filtering):
+
+```bash
+python slam.py --config configs/experiments/b3_control_short.yaml --seed 2 --exp_name B3_control_seed2
+python slam.py --config configs/experiments/b3_soft_short.yaml --seed 2 --exp_name B3_soft_seed2
+python slam.py --config configs/experiments/b3_hard_short.yaml --seed 2 --exp_name B3_hard_seed2
+```
+
+Control uses weight 1, soft uses 0.5, hard uses 0. All three use tracking mode;
+the control is NOT the old observe-mode B1. Candidate masks are computed at the
+same warmup iteration and held fixed. All variants use the same conservative
+hard-candidate retention test (256 pixels / 25% union support). If it fails,
+weights become 1 everywhere; no soft fallback threshold is retuned.
+
+Weights multiply BOTH sides of the existing masked L1 RGB/depth residual.
+For nonnegative weights this is exactly linear loss weighting, not squared
+weighting. Original image-wide mean denominators and RGB/depth mixing remain
+unchanged; there is no normalization by sum of weights. Semantic/flow masks,
+RGB opacity weighting, and mapping loss code remain unchanged.
+
+Decision NPZ files additionally contain `tracking_weights` every frame.
+`applied_keep_mask` means nonzero weight. Thus soft observations remain supported
+and applied exclusion counts are zero, even though their contribution is reduced.
+`mask_applied` indicates an accepted nontrivial weight policy; it is false for
+weight-1 control. `decision_accepted` reports the common fallback decision.
+Per-scope `*_downweighted_pixels`, `*_weight_sum`, `*_mean_weight` report effective
+weighting (not actual gradient strength). Candidate hard-exclusion counts remain
+available. The compact analyzer now validates weights and plots downweighted
+pixels in red; CSVs include both downweighted and fully excluded counts.
+
+Run the three seed-2 experiments as an integration check, then repeat all three
+with seeds 0 and 1. Do not reuse old hard-run scores as the only control. Compare
+ATE RMSE, repeatability, iterations and weight statistics. Diagnostic I/O is
+included in runtime. No full server SLAM validation has been performed locally.

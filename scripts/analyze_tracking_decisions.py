@@ -44,7 +44,18 @@ def validate(a, row):
     candidate, applied = a['candidate_keep_mask'], a['applied_keep_mask']
     if np.any(~candidate & ~a['map_valid']):
         raise ValueError('Candidate excludes unknown map coverage')
-    expected = candidate if bool(a['mask_applied']) else np.ones(shape, bool)
+    if 'tracking_weights' in a:
+        weights = a['tracking_weights']
+        if weights.shape != shape or not np.isfinite(weights).all() or np.any((weights < 0) | (weights > 1)):
+            raise ValueError('Invalid tracking weights')
+        expected_weights = np.ones(shape, dtype=np.float32)
+        if row['decision_accepted']:
+            expected_weights[~candidate] = row['inconsistent_weight']
+        if not np.allclose(weights, expected_weights):
+            raise ValueError('Weights disagree with decision metadata')
+        expected = weights > 0
+    else:
+        expected = candidate if bool(a['mask_applied']) else np.ones(shape, bool)
     if not np.array_equal(applied, expected):
         raise ValueError('Applied mask inconsistent with fallback')
     if not np.array_equal(a['union_support_mask'], a['rgb_support_mask'] | a['depth_support_mask']):
@@ -65,7 +76,11 @@ def counts(a, support, scope, frame, region):
     candidate = support & ~a['candidate_keep_mask']
     excluded = support & ~a['applied_keep_mask']
     n = int(support.sum())
-    return dict(frame=frame, scope=scope, region=region, support_pixels=n,
+    weights = a.get('tracking_weights', a['applied_keep_mask'].astype(float))
+    return dict(weight_sum=float(weights[support].sum()),
+                mean_weight=float(weights[support].mean()) if n else None,
+                downweighted_pixels=int((support & (weights < 1)).sum()),
+                frame=frame, scope=scope, region=region, support_pixels=n,
                 candidate_excluded_pixels=int(candidate.sum()),
                 applied_excluded_pixels=int(excluded.sum()),
                 retained_pixels=n-int(excluded.sum()),
@@ -136,9 +151,9 @@ def main():
                 fig, axes = plt.subplots(2, 3, figsize=(14, 8), constrained_layout=True)
                 axes[0, 0].imshow(rgb); axes[0, 0].set_title(f'Frame {frame}: decision RGB')
                 for ax, scope in [(axes[0, 1], 'rgb'), (axes[0, 2], 'depth')]:
-                    image = rgb.copy(); m = a[scope+'_applied_excluded_mask']
+                    image = rgb.copy(); m = a[scope+'_support_mask'] & (a.get('tracking_weights', a['applied_keep_mask']) < 1)
                     image[m] = .3*image[m] + .7*np.array([1, .15, 0])
-                    ax.imshow(image); ax.set_title(scope.upper()+' actual exclusions (red)')
+                    ax.imshow(image); ax.set_title(scope.upper()+' downweighted incl. excluded (red)')
                 union = a['union_support_mask']
                 image = rgb.copy(); retained = union & a['applied_keep_mask']
                 image[retained] = .3*image[retained] + .7*np.array([0, 1, .2])
@@ -155,13 +170,15 @@ def main():
     summaries = []
     for scope in ['rgb', 'depth', 'union']:
         group = [r for r in rows if r['scope'] == scope]
-        total = {k: sum(r[k] for r in group) for k in ['support_pixels', 'candidate_excluded_pixels', 'applied_excluded_pixels', 'retained_pixels']}
+        total = {k: sum(r[k] for r in group) for k in ['support_pixels', 'candidate_excluded_pixels', 'applied_excluded_pixels', 'retained_pixels', 'weight_sum', 'downweighted_pixels']}
+        total['mean_weight'] = total['weight_sum']/total['support_pixels'] if total['support_pixels'] else None
         summaries.append(dict(scope=scope, **total, applied_excluded_percent=percent(total['applied_excluded_pixels'], total['support_pixels'])))
     fig, axes = plt.subplots(2, 1, figsize=(11, 7), constrained_layout=True)
     for scope in ['rgb', 'depth', 'union']:
         g = [r for r in rows if r['scope'] == scope]
         axes[0].plot([r['frame'] for r in g], [r['applied_excluded_percent'] if r['applied_excluded_percent'] is not None else np.nan for r in g], label=scope)
-    axes[0].set(ylabel='Actual exclusions / support (%)'); axes[0].legend()
+        axes[0].plot([r['frame'] for r in g], [percent(r['downweighted_pixels'], r['support_pixels']) for r in g], '--', label=scope+' downweighted')
+    axes[0].set(ylabel='Support affected (%)'); axes[0].legend()
     g = [r for r in rows if r['scope'] == 'union']
     axes[1].plot([r['frame'] for r in g], [r['tracking_iterations'] for r in g])
     axes[1].set(xlabel='Frame', ylabel='Tracking iterations')
@@ -190,6 +207,7 @@ def main():
         'Blank CSV percentages mean zero support, not zero error.\n'
         'Residual plots share +/-0.2 m; positive means rendered depth farther.\n'
         'No per-frame ATE/RPE or causal claims are inferred from masks.\n'
+        'Soft weights: downweighted means weight <1; excluded means weight=0. Dashed curves show downweighted.\n'
         'No raw NPZ or source images are included in the report archive.\n')
     archive = args.output/'analysis_report.zip'
     with zipfile.ZipFile(archive, 'x', compression=zipfile.ZIP_DEFLATED) as z:

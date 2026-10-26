@@ -25,10 +25,13 @@ class ConsistencyConfig:
     rgb_tolerance: float = 0.15  # mean absolute error in [0, 1] RGB
     min_tracking_pixels: int = 256
     min_tracking_fraction: float = 0.25
+    inconsistent_weight: float = 0.0  # 0 hard exclusion; 1 matched no-filter control
     save_tracking_decisions: bool = False
     save_every: int = 30  # 0 disables dense NPZ dumps, not JSONL summaries
 
     def __post_init__(self):
+        if not math.isfinite(self.inconsistent_weight) or not 0 <= self.inconsistent_weight <= 1:
+            raise ValueError("inconsistent_weight must be finite and in [0, 1]")
         if not isinstance(self.save_tracking_decisions, bool):
             raise ValueError("save_tracking_decisions must be boolean")
         if self.mode not in ("off", "observe", "tracking"):
@@ -197,7 +200,7 @@ def tracking_support_statistics(evidence, supports, applied_keep):
 
 @torch.no_grad()
 def save_tracking_decision(folder, frame, iteration, evidence, supports, applied_keep,
-                           info, config, observed_rgb, rotation, translation):
+                           info, config, observed_rgb, rotation, translation, weights=None):
     """Save the decision BEFORE its first optimizer update; never change inputs.
 
     Masks are saved every decision frame. Dense evidence/RGB/pose use save_every.
@@ -221,13 +224,15 @@ def save_tracking_decision(folder, frame, iteration, evidence, supports, applied
         tensors[name + "_candidate_excluded_mask"] = support & ~candidate_keep
         tensors[name + "_applied_excluded_mask"] = support & ~effective_keep
     dense = bool(config.save_every and frame % config.save_every == 0)
+    if weights is not None:
+        tensors["tracking_weights"] = weights
     if dense:
         tensors.update(evidence)
         tensors.update(observed_rgb=observed_rgb, world_to_camera_R=rotation,
                        world_to_camera_T=translation)
     arrays = {k: v.detach().cpu().numpy() for k, v in tensors.items()}
     arrays.update(frame=np.int64(frame), mask_iteration=np.int64(iteration),
-                  dense_diagnostics=np.bool_(dense), mask_applied=np.bool_(applied_keep is not None),
+                  dense_diagnostics=np.bool_(dense), mask_applied=np.bool_(info.get("mask_applied", applied_keep is not None)),
                   depth_definition=np.asarray(config.depth_definition))
     np.savez_compressed(folder / f"{frame:06d}.npz", **arrays)
     record = {**info, "frame": int(frame), "mask_iteration": int(iteration),
@@ -236,3 +241,30 @@ def save_tracking_decision(folder, frame, iteration, evidence, supports, applied
               "dense_diagnostics": dense, "npz_file": f"{frame:06d}.npz"}
     with (folder / "summary.jsonl").open("a") as stream:
         stream.write(json.dumps(record, allow_nan=False) + "\n")
+
+
+@torch.no_grad()
+def select_tracking_weights(evidence, supports, config):
+    """Use the same conservative hard-mask acceptance test for all weights.
+
+    Float masks multiply both sides of the existing L1 residual, hence weight
+    the loss linearly. No change to the original mean denominator is needed.
+    """
+    candidate, info = select_tracking_mask(evidence, supports["union"], config)
+    accepted = candidate is not None
+    weights = torch.ones_like(evidence["depth_score"])
+    if accepted:
+        weights[~candidate] = config.inconsistent_weight
+    applied_keep = weights > 0
+    info.update(tracking_support_statistics(evidence, supports, applied_keep))
+    info.update(inconsistent_weight=config.inconsistent_weight,
+                decision_accepted=accepted,
+                mask_applied=accepted and config.inconsistent_weight < 1,
+                applied_retained_support_pixels=int((supports["union"] & applied_keep).sum().item()),
+                applied_excluded_pixels=int((supports["union"] & ~applied_keep).sum().item()))
+    for name, support in supports.items():
+        n = int(support.sum().item())
+        info[name + "_downweighted_pixels"] = int((support & (weights < 1)).sum().item())
+        info[name + "_weight_sum"] = float(weights[support].sum().item())
+        info[name + "_mean_weight"] = float(weights[support].mean().item()) if n else None
+    return weights, info
