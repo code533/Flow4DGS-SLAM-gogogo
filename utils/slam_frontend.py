@@ -21,6 +21,7 @@ from gaussian_splatting.utils.loss_utils import l1_loss, ssim
 import os
 import matplotlib.pyplot as plt
 import random
+from utils.v40_diagnostics import static_render_snapshot, save_frame
 from utils.slam_backend import segment_motion_parametric, fit_twist_weighted, pixels_to_flow_units, flow_to_pixels
 import torch.nn.functional as F
 from utils.pose_utils import SE3_exp, scale_se3_step, SO3_exp, so3_log
@@ -216,6 +217,7 @@ class FrontEnd(mp.Process):
         self.flow_cam_v30_cfg = config["model_params"].get("flow_cam_v30", {})  # CIMD-V30
         self.flow_cam_v31_cfg = config["model_params"].get("flow_cam_v31", {})  # CIMD-V31
         self.flow_cam_v31a_cfg = config["model_params"].get("flow_cam_v31a", {})  # CIMD-V31A
+        self.v40_cfg = config["model_params"].get("v40_diagnostics", {})
 
         self.dynamic_objects = 0
 
@@ -354,6 +356,10 @@ class FrontEnd(mp.Process):
         os.makedirs(output_dir, exist_ok=True)
         initial_motion_mask = viewpoint.motion_mask.clone()
         flow_residual_px_v2 = None  # V2 uses flow residual from the unmodified motion decomposition
+        v40_due = (bool(self.v40_cfg.get('enabled', False)) and cur_frame_idx > 0
+                   and cur_frame_idx % max(1, int(self.v40_cfg.get('every', 10))) == 0)
+        v40_pre = None
+        v40_flow_mask = None
         # CIMD-V30: diagnostics and optional translation clamp are isolated
         # from V1-V2.2 tracking-weight experiments.
         v30cfg = self.flow_cam_v30_cfg
@@ -428,6 +434,8 @@ class FrontEnd(mp.Process):
             if v31on:
                 v31first = results.get("fit_diag")
             flow_mask = results['mask_bool']
+            if v40_due:
+                v40_flow_mask = flow_mask.detach().clone()
             flow_residual_px_v2 = results['resid_px'].detach()  # UP-FLOW-RGBD-V2
             
             viewpoint.motion_mask = viewpoint.motion_mask & (~flow_mask)
@@ -692,6 +700,19 @@ class FrontEnd(mp.Process):
         v22_gate = None
         v22_update_count = 0
         v22_last_iteration = -1
+
+        # V4.0: static-only render after flow initialization, before tracking.
+        if v40_due:
+            if not self.flow_mask:
+                raise RuntimeError("V4.0 requires flow_mask: true")
+            with torch.no_grad():
+                pre_pkg_v40 = render(
+                    viewpoint, self.gaussians, self.pipeline_params, self.background,
+                    dynamic=False, dx=dxyz, ds=d_scale, dr=d_rot,
+                    mask=(self.gaussians.dygs == False))
+                v40_pre = static_render_snapshot(
+                    viewpoint, pre_pkg_v40,
+                    opacity_min=float(self.v40_cfg.get("opacity_min", 0.95)))
 
         for tracking_itr in range(self.tracking_itr_num):
             render_pkg = render(
@@ -1063,6 +1084,34 @@ class FrontEnd(mp.Process):
                       v31a_data.get("n_holdout", 0),
                       v31a_data.get("legacy_holdout_rmse_px", float("nan")),
                       v31a_data.get("geo_holdout_rmse_px", float("nan"))))
+
+        # V4.0: read-only post-tracking snapshot. Never enters loss or Mapping.
+        if v40_due and v40_pre is not None:
+            with torch.no_grad():
+                post_pkg_v40 = render(
+                    viewpoint, self.gaussians, self.pipeline_params, self.background,
+                    dynamic=False, dx=dxyz, ds=d_scale, dr=d_rot,
+                    mask=(self.gaussians.dygs == False))
+                v40_post = static_render_snapshot(
+                    viewpoint, post_pkg_v40,
+                    opacity_min=float(self.v40_cfg.get("opacity_min", 0.95)))
+                valid_depth_v40 = torch.as_tensor(
+                    viewpoint.depth, device=flow_residual_px_v2.device
+                ).squeeze()
+                flow_valid_v40 = ((valid_depth_v40 > 0) & torch.isfinite(valid_depth_v40)
+                                  & initial_motion_mask.to(valid_depth_v40.device).bool())
+                row_v40 = save_frame(
+                    os.path.join(self.save_dir, "v40_diagnostics"), viewpoint.uid,
+                    v40_pre, v40_post,
+                    flow_residual_px_v2.detach().cpu().numpy(),
+                    v40_flow_mask.detach().cpu().numpy(),
+                    flow_valid_v40.detach().cpu().numpy(),
+                    initial_motion_mask.detach().cpu().numpy(),
+                    viewpoint.motion_mask.detach().cpu().numpy(),
+                    save_maps=bool(self.v40_cfg.get("save_maps", True)))
+                print("[V4.0] frame={} coverage={:.3f} flow_med={:.3f}px rgb_pre={:.4f}".format(
+                    viewpoint.uid, row_v40["map_covered_pre_fraction"],
+                    row_v40["flow_residual_median_px"], row_v40["rgb_pre_mean_covered"]))
 
         self.median_depth = get_median_depth(depth, opacity)
 
