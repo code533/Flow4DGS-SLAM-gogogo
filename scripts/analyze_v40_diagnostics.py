@@ -41,7 +41,7 @@ def main():
             groups = {
                 "candidate_static_covered": prior & ~m & covered & valid,
                 "candidate_dynamic_covered": prior & m & covered & valid,
-                "prior_dynamic_covered": ~prior & covered & valid,
+                "prior_dynamic_covered": ~prior & covered,
                 "map_uncovered_valid_flow": ~covered & valid,
             }
             fid = int(file.stem.split("_")[-1])
