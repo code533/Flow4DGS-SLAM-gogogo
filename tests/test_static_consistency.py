@@ -4,7 +4,7 @@ import torch
 
 from utils.static_consistency import (
     ConsistencyConfig, DYNAMIC, STATIC, UNKNOWN, compute_evidence, select_tracking_mask,
-    tracking_supports, tracking_support_statistics,
+    tracking_supports, tracking_support_statistics, save_tracking_decision,
 )
 
 
@@ -68,6 +68,47 @@ class StaticConsistencyTests(unittest.TestCase):
         _, info = select_tracking_mask(evidence, empty, self.cfg)
         self.assertIsNone(info["candidate_excluded_fraction"])
         self.assertEqual(info["fallback_reason"], "empty_support")
+
+    def test_decision_files_capture_applied_and_fallback_masks(self):
+        import tempfile
+        import json
+        import numpy as np
+        from pathlib import Path
+        cfg = ConsistencyConfig(mode="tracking", save_tracking_decisions=True,
+                                save_every=10, min_tracking_pixels=1)
+        rendered = self.rgb.clone()
+        rendered[:, 0, 0] = 1.0
+        evidence = self.evidence(rendered=rendered)
+        original = {k: v.clone() for k, v in evidence.items()}
+        support = torch.ones_like(self.z, dtype=torch.bool)
+        supports = {k: support for k in ["rgb", "depth", "union"]}
+        keep, info = select_tracking_mask(evidence, support, cfg)
+        with tempfile.TemporaryDirectory() as tmp:
+            for frame, applied in [(10, keep), (11, None)]:
+                local_info = dict(info, mask_applied=applied is not None)
+                save_tracking_decision(tmp, frame, 10, evidence, supports, applied,
+                                       local_info, cfg, self.rgb, torch.eye(3), torch.zeros(3))
+            with np.load(Path(tmp)/"000010.npz", allow_pickle=False) as data:
+                self.assertEqual(data["union_applied_excluded_mask"].sum(), 1)
+                self.assertTrue(np.array_equal(data["union_applied_excluded_mask"],
+                                               data["union_candidate_excluded_mask"]))
+                self.assertIn("signed_depth_accumulated", data.files)
+                self.assertIn("observed_rgb", data.files)
+                self.assertEqual(data["mask_iteration"], 10)
+            with np.load(Path(tmp)/"000011.npz", allow_pickle=False) as data:
+                self.assertTrue(data["applied_keep_mask"].all())
+                self.assertEqual(data["union_applied_excluded_mask"].sum(), 0)
+                self.assertEqual(data["union_candidate_excluded_mask"].sum(), 1)
+                self.assertNotIn("observed_rgb", data.files)
+            rows = [json.loads(l) for l in (Path(tmp)/"summary.jsonl").read_text().splitlines()]
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(rows[0]["evaluation_pose"], "before_mask_iteration_update")
+            disabled = Path(tmp)/"disabled"
+            save_tracking_decision(disabled, 10, 10, evidence, supports, keep, info,
+                                   ConsistencyConfig(), self.rgb, torch.eye(3), torch.zeros(3))
+            self.assertFalse(disabled.exists())
+        for k in evidence:
+            self.assertTrue(torch.allclose(evidence[k], original[k], equal_nan=True), k)
 
     def test_matching_surface_is_static(self):
         self.assertTrue((self.evidence()["state"] == STATIC).all())

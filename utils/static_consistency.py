@@ -25,9 +25,12 @@ class ConsistencyConfig:
     rgb_tolerance: float = 0.15  # mean absolute error in [0, 1] RGB
     min_tracking_pixels: int = 256
     min_tracking_fraction: float = 0.25
+    save_tracking_decisions: bool = False
     save_every: int = 30  # 0 disables dense NPZ dumps, not JSONL summaries
 
     def __post_init__(self):
+        if not isinstance(self.save_tracking_decisions, bool):
+            raise ValueError("save_tracking_decisions must be boolean")
         if self.mode not in ("off", "observe", "tracking"):
             raise ValueError("StaticConsistency.mode must be off, observe or tracking")
         if self.depth_definition not in ("accumulated", "normalized"):
@@ -190,3 +193,46 @@ def tracking_support_statistics(evidence, supports, applied_keep):
                        f"{name}_applied_retained_pixels": after,
                        f"{name}_applied_excluded_fraction": (before-after)/before if before else None})
     return result
+
+
+@torch.no_grad()
+def save_tracking_decision(folder, frame, iteration, evidence, supports, applied_keep,
+                           info, config, observed_rgb, rotation, translation):
+    """Save the decision BEFORE its first optimizer update; never change inputs.
+
+    Masks are saved every decision frame. Dense evidence/RGB/pose use save_every.
+    Support-based exclusions describe this instant, not all later iterations.
+    """
+    if not config.save_tracking_decisions:
+        return
+    import json
+    from pathlib import Path
+    import numpy as np
+
+    folder = Path(folder)
+    folder.mkdir(parents=True, exist_ok=True)
+    candidate_keep = ~evidence["map_inconsistent"]
+    effective_keep = torch.ones_like(candidate_keep) if applied_keep is None else applied_keep
+    tensors = {"candidate_keep_mask": candidate_keep,
+               "applied_keep_mask": effective_keep,
+               "map_valid": evidence["map_valid"]}
+    for name, support in supports.items():
+        tensors[name + "_support_mask"] = support
+        tensors[name + "_candidate_excluded_mask"] = support & ~candidate_keep
+        tensors[name + "_applied_excluded_mask"] = support & ~effective_keep
+    dense = bool(config.save_every and frame % config.save_every == 0)
+    if dense:
+        tensors.update(evidence)
+        tensors.update(observed_rgb=observed_rgb, world_to_camera_R=rotation,
+                       world_to_camera_T=translation)
+    arrays = {k: v.detach().cpu().numpy() for k, v in tensors.items()}
+    arrays.update(frame=np.int64(frame), mask_iteration=np.int64(iteration),
+                  dense_diagnostics=np.bool_(dense), mask_applied=np.bool_(applied_keep is not None),
+                  depth_definition=np.asarray(config.depth_definition))
+    np.savez_compressed(folder / f"{frame:06d}.npz", **arrays)
+    record = {**info, "frame": int(frame), "mask_iteration": int(iteration),
+              "mode": config.mode, "depth_definition": config.depth_definition,
+              "evaluation_pose": "before_mask_iteration_update",
+              "dense_diagnostics": dense, "npz_file": f"{frame:06d}.npz"}
+    with (folder / "summary.jsonl").open("a") as stream:
+        stream.write(json.dumps(record, allow_nan=False) + "\n")

@@ -21,7 +21,7 @@ import random
 from utils.slam_backend import segment_motion_parametric, fit_twist_weighted, pixels_to_flow_units, flow_to_pixels
 import torch.nn.functional as F
 from utils.pose_utils import SE3_exp, scale_se3_step, SO3_exp, so3_log
-from utils.static_consistency import ConsistencyConfig, compute_evidence, select_tracking_mask, tracking_supports, tracking_support_statistics
+from utils.static_consistency import ConsistencyConfig, compute_evidence, select_tracking_mask, tracking_supports, tracking_support_statistics, save_tracking_decision
 
 
 def flow_to_pixels(flow_norm, H, W, mode='grid'):
@@ -556,6 +556,11 @@ class FrontEnd(mp.Process):
                     consistency_info.update(tracking_support_statistics(evidence, supports, consistency_keep))
                     consistency_info["support_evaluation_pose"] = "before_mask_iteration_update"
                     consistency_info["mask_iteration"] = tracking_itr
+                    save_tracking_decision(
+                        os.path.join(self.save_dir, "tracking_decisions"),
+                        int(viewpoint.uid), tracking_itr, evidence, supports, consistency_keep,
+                        consistency_info, self.consistency, viewpoint.original_image,
+                        viewpoint.R, viewpoint.T)
                     consistency_evaluated = True
                 if consistency_keep is not None:
                     mask = consistency_keep if mask is None else mask & consistency_keep

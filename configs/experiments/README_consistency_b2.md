@@ -58,3 +58,37 @@ python scripts/visualize_consistency.py --results /path/to/run --compare-depth -
 Compare trajectory ATE/RPE, failures, fallback frequency, actual support removal
 and runtime. Lower mismatch rate alone is not evidence of better motion detection
 or better tracking. Full CUDA/SLAM execution must be verified on the server.
+
+## Decision-time diagnostics
+
+The short-run parent now sets `StaticConsistency.save_tracking_decisions: true`.
+The default for other configurations is false. Tracking mode writes a separate
+`tracking_decisions/` directory immediately after selection/fallback, before the
+first optimizer update using the mask. Observe mode does not create this directory
+and does not add a warmup decision or change its stopping rule.
+
+Every tracking frame gets a compressed NPZ with RGB/depth/union support masks,
+candidate exclusions, actual exclusions, candidate keep and applied keep masks,
+map validity, frame, zero-based mask iteration and the active depth definition.
+On fallback the applied keep mask is all true and actual exclusions are empty;
+candidate exclusions remain available. These masks are the EXTRA consistency
+filter, not replacements for the semantic/flow motion mask. Actual exclusions
+are restricted to the corresponding support at the decision instant.
+
+At `save_every` frames (10 in the short configs), the same NPZ additionally
+contains the full evidence dictionary, observed RGB (CHW float), and camera R/T
+at the decision pose. Dense fields include observed/raw/normalized depths,
+opacity, both signed residuals, tolerance and RGB score. `save_every: 0` disables
+these dense additions but still saves decision masks when enabled. Each decision
+also appends metadata and existing selection statistics to
+`tracking_decisions/summary.jsonl`; `dense_diagnostics` marks dense frames.
+
+These files differ from `static_consistency/`, whose evidence is rendered AFTER
+tracking. The original offline `--compare-depth` mode expects dense post-tracking
+exports, not this mixed sparse/dense decision directory. A dedicated decision
+analysis can use the saved mask fields directly.
+
+Saving synchronizes tensors to CPU and compresses files inside tracking, so
+reported tracking time includes diagnostic I/O. Use recording-disabled runs for
+runtime benchmarks. No loss, threshold, mask-selection or stopping rule changes
+are introduced by this recorder. Full SLAM validation remains a server task.

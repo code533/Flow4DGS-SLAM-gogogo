@@ -8,4 +8,5 @@ Dataset:
 StaticConsistency:
   mode: observe
   depth_definition: normalized
+  save_tracking_decisions: true
   save_every: 10
