@@ -77,6 +77,13 @@ model_params:
     every: 10
     opacity_min: 0.95
     save_maps: true
+  # V4.0a full-flow + static-map observations; no effect on SLAM optimization.
+  v40a_diagnostics:
+    enabled: false
+    every: 10
+    opacity_min: 0.95
+    save_maps: true
+    forward_backward: true
   data_device: cuda
   depth_check: true
   dynamic_model: offset
