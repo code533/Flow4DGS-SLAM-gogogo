@@ -446,7 +446,7 @@ class FrontEnd(mp.Process):
             if v40a_due:
                 # Recompute unmasked diagnostic residual using the fitted first-stage twist.
                 with torch.no_grad():
-                    from utils.slam_backend import predict_rigid_flow_px
+                    # Use module-level predict_rigid_flow_px; no local binding.
                     measured_px = flow_to_pixels(
                         flow_back.permute(2, 0, 1), H, W, mode="grid")
                     predicted_px = predict_rigid_flow_px(
