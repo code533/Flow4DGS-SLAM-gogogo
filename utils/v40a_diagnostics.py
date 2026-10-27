@@ -37,7 +37,7 @@ def forward_raft_flow_px(viewpoint, previous):
     Camera.generate_flow. Only execute for sampled V4.0a frames.
     """
     from RAFT.utils.utils import InputPadder
-    device = viewpoint.original_image.device
+    device = next(viewpoint.model.parameters()).device
     prev = (previous.original_image.detach().to(device) * 255.0)[None]
     curr = (viewpoint.original_image.detach().to(device) * 255.0)[None]
     padder = InputPadder(prev.shape)
