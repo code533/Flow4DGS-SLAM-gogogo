@@ -79,6 +79,19 @@ model_params:
     opacity_min: 0.95
     save_maps: true
     forward_backward: true
+  # V4.0b: independent reliability calibration; V4.0/V4.0a OFF.
+  v40b_calibration:
+    enabled: false
+    every: 10
+    opacity_min: 0.95
+    save_maps: true
+    forward_backward: true
+    depth_edge_abs_m: 0.08
+    depth_edge_rel: 0.06
+    depth_edge_dilate: 2
+    fb_bad_px: 1.0
+    high_motion_px: 5.0
+    low_fb_px: 0.5
   data_device: cuda
   dynamic_model: offset
   # Optional V2: conservative flow + static RGB-D residual fusion for Tracking.
