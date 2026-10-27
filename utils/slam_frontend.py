@@ -23,6 +23,8 @@ import matplotlib.pyplot as plt
 import random
 from utils.v40_diagnostics import static_render_snapshot, save_frame
 from utils.v40a_diagnostics import full_flow_residual_px, forward_raft_flow_px, assemble_frame, save_frame as save_v40a_frame, flow_cycle_error_px
+from utils.v40b_calibration import (
+    normalized_tracking_flow_to_native_px, visibility_proxies, save_v40b)
 from utils.slam_backend import segment_motion_parametric, fit_twist_weighted, pixels_to_flow_units, flow_to_pixels
 import torch.nn.functional as F
 from utils.pose_utils import SE3_exp, scale_se3_step, SO3_exp, so3_log
@@ -220,6 +222,7 @@ class FrontEnd(mp.Process):
         self.flow_cam_v31a_cfg = config["model_params"].get("flow_cam_v31a", {})  # CIMD-V31A
         self.v40_cfg = config["model_params"].get("v40_diagnostics", {})
         self.v40a_cfg = config["model_params"].get("v40a_diagnostics", {})
+        self.v40b_cfg = config["model_params"].get("v40b_calibration", {})
 
         self.dynamic_objects = 0
 
@@ -367,6 +370,14 @@ class FrontEnd(mp.Process):
         v40a_pre = None
         v40a_flow = v40a_flow_valid = v40a_legacy = None
         v40a_fb = v40a_fb_valid = v40a_flow_dynamic = None
+        v40b_due = (bool(self.v40b_cfg.get("enabled", False)) and cur_frame_idx > 0
+                    and cur_frame_idx % max(1, int(self.v40b_cfg.get("every", 10))) == 0)
+        if v40b_due and (v40_due or v40a_due):
+            raise RuntimeError("V4.0b requires V4.0 and V4.0a disabled")
+        v40b_pre = v40b_values = v40b_masks = None
+        v40b_fb = v40b_fb_valid = None
+        v40b_fb_legacy = None
+        v40b_flow_dynamic = None
         # CIMD-V30: diagnostics and optional translation clamp are isolated
         # from V1-V2.2 tracking-weight experiments.
         v30cfg = self.flow_cam_v30_cfg
@@ -443,6 +454,44 @@ class FrontEnd(mp.Process):
             flow_mask = results['mask_bool']
             if v40_due:
                 v40_flow_mask = flow_mask.detach().clone()
+            if v40b_due:
+                with torch.no_grad():
+                    # Preserve original first-stage flow geometry convention
+                    # for motion residual; use native RAFT pixels ONLY for
+                    # forward/backward correspondence and visibility warps.
+                    measured_grid_px_b = flow_to_pixels(
+                        flow_back.permute(2, 0, 1), H, W, mode="grid")
+                    rigid_grid_px_b = predict_rigid_flow_px(
+                        depth_tensor, viewpoint.intrinsic.cuda(), results["xi"])
+                    v40b_motion_resid, v40b_motion_valid = full_flow_residual_px(
+                        measured_grid_px_b, rigid_grid_px_b, depth_tensor)
+                    v40b_native = normalized_tracking_flow_to_native_px(
+                        flow_back.detach(), H, W)
+                    v40b_forward = None
+                    v40b_fb = torch.full_like(depth_tensor, float("nan"))
+                    v40b_fb_valid = torch.zeros_like(depth_tensor, dtype=torch.bool)
+                    if bool(self.v40b_cfg.get("forward_backward", True)):
+                        v40b_forward = forward_raft_flow_px(viewpoint, prev)
+                        v40b_fb, v40b_fb_valid = flow_cycle_error_px(
+                            v40b_native, v40b_forward)
+                        v40b_fb_legacy, _ = flow_cycle_error_px(
+                            measured_grid_px_b.permute(1, 2, 0), v40b_forward)
+                    v40b_masks = visibility_proxies(
+                        depth_tensor, torch.as_tensor(
+                            prev.depth, device=depth_tensor.device, dtype=depth_tensor.dtype),
+                        v40b_native, v40b_fb, v40b_fb_valid,
+                        abs_edge_m=float(self.v40b_cfg.get("depth_edge_abs_m", .08)),
+                        rel_edge=float(self.v40b_cfg.get("depth_edge_rel", .06)),
+                        dilate_edge=int(self.v40b_cfg.get("depth_edge_dilate", 2)),
+                        fb_bad_px=float(self.v40b_cfg.get("fb_bad_px", 1.0)))
+                    v40b_values = {
+                        "full_flow": v40b_motion_resid.detach(),
+                        "full_valid": v40b_motion_valid.detach(),
+                        "legacy": results["resid_px"].detach(),
+                        "native_backward": v40b_native.detach(),
+                        "native_forward": v40b_forward.detach() if v40b_forward is not None else None,
+                    }
+                    v40b_flow_dynamic = flow_mask.detach().clone()
             if v40a_due:
                 # Recompute unmasked diagnostic residual using the fitted first-stage twist.
                 with torch.no_grad():
@@ -727,7 +776,7 @@ class FrontEnd(mp.Process):
         v22_last_iteration = -1
 
         # V4.0: static-only render after flow initialization, before tracking.
-        if v40_due or v40a_due:
+        if v40_due or v40a_due or v40b_due:
             if not self.flow_mask:
                 raise RuntimeError("V4.0 requires flow_mask: true")
             with torch.no_grad():
@@ -739,6 +788,14 @@ class FrontEnd(mp.Process):
                     v40_pre = static_render_snapshot(
                         viewpoint, pre_pkg_v40,
                         opacity_min=float(self.v40_cfg.get("opacity_min", 0.95)))
+                if v40b_due:
+                    v40b_pre = static_render_snapshot(
+                        viewpoint, pre_pkg_v40,
+                        opacity_min=float(self.v40b_cfg.get("opacity_min", 0.95)))
+                    v40b_pred_depth_pre = pre_pkg_v40["depth"].detach().squeeze().cpu().numpy()
+                    v40b_pred_rgb_pre = (
+                        torch.exp(viewpoint.exposure_a.detach()) * pre_pkg_v40["render"].detach()
+                        + viewpoint.exposure_b.detach()).clamp(0, 1).permute(1, 2, 0).mul(255).byte().cpu().numpy()
                 if v40a_due:
                     v40a_pre = static_render_snapshot(
                         viewpoint, pre_pkg_v40,
@@ -1178,6 +1235,46 @@ class FrontEnd(mp.Process):
                     viewpoint.uid, row_a["map_covered_pre_fraction"],
                     row_a["flow_full_median_px"], row_a["common_valid_fraction"],
                     row_a["fb_median_px"]))
+
+        # V4.0b: read-only instrumented snapshots. All fitter / loss inputs
+        # above remain identical, with no modifications to optimizer or mask.
+        if v40b_due and v40b_pre is not None:
+            with torch.no_grad():
+                post_pkg_b = render(
+                    viewpoint, self.gaussians, self.pipeline_params, self.background,
+                    dynamic=False, dx=dxyz, ds=d_scale, dr=d_rot,
+                    mask=(self.gaussians.dygs == False))
+                v40b_post = static_render_snapshot(
+                    viewpoint, post_pkg_b,
+                    opacity_min=float(self.v40b_cfg.get("opacity_min", 0.95)))
+                def as_np(tensor):
+                    return tensor.detach().cpu().numpy()
+                maps_b = assemble_frame(
+                    viewpoint.uid, v40b_pre, v40b_post,
+                    as_np(v40b_values["full_flow"]), as_np(v40b_values["full_valid"]),
+                    as_np(v40b_values["legacy"]),
+                    as_np(initial_motion_mask),
+                    as_np(v40b_flow_dynamic),
+                    as_np(viewpoint.motion_mask),
+                    torch.as_tensor(viewpoint.depth).squeeze().cpu().numpy(),
+                    v40b_pred_depth_pre,
+                    as_np(post_pkg_b["depth"].squeeze()),
+                    as_np(viewpoint.original_image.detach().clamp(0, 1).permute(1, 2, 0).mul(255).byte()),
+                    v40b_pred_rgb_pre,
+                    fb_error=as_np(v40b_fb), fb_valid=as_np(v40b_fb_valid))
+                maps_b.update({k: as_np(v) for k, v in v40b_masks.items()})
+                maps_b["flow_backward_native_px"] = as_np(v40b_values["native_backward"])
+                if v40b_values["native_forward"] is not None:
+                    maps_b["flow_forward_native_px"] = as_np(v40b_values["native_forward"])
+                    maps_b["fb_error_legacy_grid_px"] = as_np(v40b_fb_legacy)
+                row_b = save_v40b(
+                    os.path.join(self.save_dir, "v40b_calibration"), maps_b,
+                    save_maps=bool(self.v40b_cfg.get("save_maps", True)),
+                    high_motion_px=float(self.v40b_cfg.get("high_motion_px", 5.0)),
+                    low_fb_px=float(self.v40b_cfg.get("low_fb_px", 0.5)))
+                print("[V4.0b] frame={} coverage={:.3f} interior={:.3f} FB={:.3f}px".format(
+                    viewpoint.uid, row_b["map_covered_pre_fraction"],
+                    row_b["interior_fraction"], row_b["fb_median_px"]))
 
         self.median_depth = get_median_depth(depth, opacity)
 
