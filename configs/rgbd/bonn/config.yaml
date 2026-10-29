@@ -272,7 +272,7 @@ model_params:
   use_gmm_rot: true
   # V4.2a mapping ablation, disabled by default.
   v42a_propagation:
-    mode: off   # off / shadow / g0 / g1 / g2
+    mode: 'off'   # off / shadow / g0 / g1 / g2 (quote off: YAML boolean trap)
     fb_scale_px: 1.0
     edge_abs_m: 0.08
     edge_rel: 0.06
