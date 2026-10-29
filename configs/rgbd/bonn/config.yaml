@@ -270,6 +270,17 @@ model_params:
   source_path: ''
   use_gmm: true
   use_gmm_rot: true
+  # V4.2a mapping ablation, disabled by default.
+  v42a_propagation:
+    mode: off   # off / shadow / g0 / g1 / g2
+    fb_scale_px: 1.0
+    edge_abs_m: 0.08
+    edge_rel: 0.06
+    edge_penalty: 0.65
+    min_support: 0.45
+    min_neighbors: 3
+    neighbor_q_min: 0.3
+    save_points: false
   use_knn: true
   white_background: false
 opt_params:
