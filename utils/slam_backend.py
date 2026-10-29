@@ -23,6 +23,7 @@ from matplotlib.patches import Patch
 from scipy import ndimage as ndi
 import seaborn as sns
 from pytorch3d.ops import knn_points
+from utils.v42a_propagation import (bidirectional_flow_reliability, gather_prior_gaussian_confidence, knn_candidates_from_precomputed, displacement_stats, save_diagnostics)
 
 def print_lrs(optimizer, step, every=50):
     if step % every != 0:
@@ -414,6 +415,12 @@ class BackEnd(mp.Process):
         self.use_knn = config["model_params"].get("use_knn", False)
         self.knn_n = config["model_params"].get("knn_n", 16)
         self.knn_r = config["model_params"].get("knn_r", 0.2)
+        self.v42a_cfg = config["model_params"].get("v42a_propagation", {})
+        self.v42a_mode = str(self.v42a_cfg.get("mode", "off")).lower()
+        if self.v42a_mode not in ("off", "shadow", "g0", "g1", "g2"):
+            raise ValueError("V4.2a mode must be off/shadow/g0/g1/g2")
+        if self.v42a_mode in ("g1", "g2") and not self.use_knn:
+            raise ValueError("V4.2a G1/G2 requires use_knn: true")
         self.depth_check = config["model_params"].get("depth_check", False)
         self.sd = config["model_params"].get("sd", False)
 
@@ -1795,7 +1802,7 @@ class BackEnd(mp.Process):
         return enlarged_mask, enlarged_region
 
 
-    def apply_flow_offset(self, flow, viewpoint, closest_viewpoint, depth_consistent=True):
+    def apply_flow_offset(self, flow, viewpoint, closest_viewpoint, depth_consistent=True, flow_back=None):
         """
         Apply flow offset to the gaussians based on the flow between the current viewpoint and the closest keyframe.
         """
@@ -1815,6 +1822,23 @@ class BackEnd(mp.Process):
         device = flow.device
 
         uvz = gaussians_uvz_coor_at_cam1.to(device)
+        v42a_active = self.v42a_mode != "off" and self.use_knn
+        v42a_diag = v42a_gauss_q = None
+        if v42a_active:
+            if flow_back is None or flow.shape != flow_back.shape:
+                raise RuntimeError("V4.2a requires full-resolution paired mapping flow")
+            if flow.shape[:2] != tuple(viewpoint.depth.shape):
+                raise ValueError("V4.2a requires flow_ds=1 and matching depth resolution")
+            with torch.no_grad():
+                q_map, v42a_diag = bidirectional_flow_reliability(
+                    flow.detach(), flow_back.detach(),
+                    torch.as_tensor(closest_viewpoint.depth, device=device, dtype=flow.dtype),
+                    torch.as_tensor(viewpoint.depth, device=device, dtype=flow.dtype),
+                    fb_scale_px=float(self.v42a_cfg.get("fb_scale_px", 1.)),
+                    edge_abs_m=float(self.v42a_cfg.get("edge_abs_m", .08)),
+                    edge_rel=float(self.v42a_cfg.get("edge_rel", .06)),
+                    edge_penalty=float(self.v42a_cfg.get("edge_penalty", .65)))
+                v42a_gauss_q = gather_prior_gaussian_confidence(uvz, q_map)
 
         
 
@@ -1887,16 +1911,38 @@ class BackEnd(mp.Process):
 
 
             if self.use_knn:
-                deformation = self.smooth_deformation_knn_radius(
-                    points=xyz_at_t1[idx2_valid],
-                    deform=deformation,
-                    k=self.knn_n,
-                    r_max=self.knn_r,
-                    weighting="gaussian",
-                    sigma=0.05,
-                    include_self=True,
-                    eps=1e-8,
-                )
+                points_v42a = xyz_at_t1[idx2_valid]
+                raw_v42a = deformation
+                g0_v42a = self.smooth_deformation_knn_radius(
+                    points=points_v42a, deform=deformation,
+                    k=self.knn_n, r_max=self.knn_r, weighting="gaussian",
+                    sigma=0.05, include_self=True, eps=1e-8)
+                deformation = g0_v42a
+                if v42a_active and raw_v42a.shape[0] > 0:
+                    with torch.no_grad():
+                        q_points = v42a_gauss_q[idx2_valid].detach()
+                        graph = knn_points(points_v42a[None], points_v42a[None],
+                                           K=min(int(self.knn_n), len(points_v42a)),
+                                           return_nn=False)
+                        g1, g2, aux = knn_candidates_from_precomputed(
+                            raw_v42a.detach(), q_points,
+                            graph.dists.squeeze(0), graph.idx.squeeze(0),
+                            g0_v42a.detach(), radius=self.knn_r, sigma=.05,
+                            g2_min_support=float(self.v42a_cfg.get("min_support", .45)),
+                            g2_min_neighbors=int(self.v42a_cfg.get("min_neighbors", 3)),
+                            neighbor_q_min=float(self.v42a_cfg.get("neighbor_q_min", .3)))
+                        row = displacement_stats(viewpoint.uid, self.v42a_mode,
+                            raw_v42a.detach(), g0_v42a.detach(), g1, g2,
+                            q_points, aux, v42a_diag)
+                        save_diagnostics(os.path.join(self.save_dir, "v42a_propagation"),
+                            row, raw=raw_v42a.detach(), g0=g0_v42a.detach(),
+                            g1=g1, g2=g2, confidence=q_points,
+                            save_points=bool(self.v42a_cfg.get("save_points", False)))
+                        print("[V4.2a] KF={} mode={} pts={} q={:.3f} g1diff={:.5f}m g2diff={:.5f}m".format(
+                            viewpoint.uid, self.v42a_mode, row["n_points"], row["q_mean"],
+                            row["g1_vs_g0_mean_m"], row["g2_vs_g0_mean_m"]))
+                        if self.v42a_mode == "g1": deformation = g1
+                        elif self.v42a_mode == "g2": deformation = g2
             
             self.gaussians.update_delta_xyz(viewpoint.uid, closest_viewpoint.uid, deformation, idx2_valid, 
                                             max_motion=0.3)
@@ -2059,7 +2105,7 @@ class BackEnd(mp.Process):
                         else:
                             
                             
-                            self.apply_flow_offset(flow, viewpoint, self.viewpoints[closest_keyframe])
+                            self.apply_flow_offset(flow, viewpoint, self.viewpoints[closest_keyframe], flow_back=flow_back)
 
                             dxyz = self.gaussians.get_delta_xyz(self.gaussians.kf_list.index(viewpoint.uid)-1)
                             d_rot, d_scale, d_opac, d_color = 0, 0, None, None
