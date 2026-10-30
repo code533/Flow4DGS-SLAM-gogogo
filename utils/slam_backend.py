@@ -25,6 +25,7 @@ import seaborn as sns
 from pytorch3d.ops import knn_points
 from utils.v42a_propagation import (bidirectional_flow_reliability, gather_prior_gaussian_confidence, knn_candidates_from_precomputed, displacement_stats, save_diagnostics)
 from utils.v42a1_diagnostics import projection_reasons, knn_motion_diagnostics, diagnostic_row, save_diag
+from utils.v42a2_propagation import shadow_g3_g4, g34_summary, save_g34
 
 def print_lrs(optimizer, step, every=50):
     if step % every != 0:
@@ -1826,7 +1827,10 @@ class BackEnd(mp.Process):
         v42a_active = self.v42a_mode != "off" and self.use_knn
         v42a_diag = v42a_gauss_q = None
         v42a1_all_reasons = None
-        v42a1_enabled = v42a_active and bool(self.v42a_cfg.get("attribute_failures", False))
+        v42a2_enabled = v42a_active and bool(self.v42a_cfg.get("g34_shadow", False))
+        v42a1_enabled = v42a_active and (bool(self.v42a_cfg.get("attribute_failures", False)) or v42a2_enabled)
+        if v42a2_enabled and self.v42a_mode != "shadow":
+            raise ValueError("V4.2a.2 G3/G4 first release is SHADOW ONLY")
         if v42a_active:
             if flow_back is None or flow.shape != flow_back.shape:
                 raise RuntimeError("V4.2a requires full-resolution paired mapping flow")
@@ -1936,6 +1940,34 @@ class BackEnd(mp.Process):
                             g2_min_support=float(self.v42a_cfg.get("min_support", .45)),
                             g2_min_neighbors=int(self.v42a_cfg.get("min_neighbors", 3)),
                             neighbor_q_min=float(self.v42a_cfg.get("neighbor_q_min", .3)))
+                        if v42a2_enabled:
+                            reasons_selected = v42a1_all_reasons["reason"][idx2_valid]
+                            g3,g4,g34diag = shadow_g3_g4(
+                                raw_v42a.detach(), q_points,
+                                graph.dists.squeeze(0), graph.idx.squeeze(0),
+                                g0_v42a.detach(), g1.detach(), reasons_selected,
+                                radius=self.knn_r,
+                                motion_sigma=float(self.v42a_cfg.get("g4_motion_sigma_m",.08)),
+                                trusted_q=float(self.v42a_cfg.get("g4_trusted_q",.3)),
+                                min_trusted_neighbors=int(self.v42a_cfg.get("g4_min_neighbors",3)),
+                                min_support=float(self.v42a_cfg.get("g4_min_support",.25)),
+                                max_consensus_disagreement_m=float(self.v42a_cfg.get("g4_max_dispersion_m",.12)),
+                                max_delta_from_g0_m=self.v42a_cfg.get("g4_max_delta_from_g0_m",None))
+                            r34=g34_summary(viewpoint.uid, self.v42a_mode,
+                                            g0_v42a.detach(),g1.detach(),g3,g4,
+                                            reasons_selected,g34diag)
+                            details=self.v42a_cfg.get("g34_detailed_frames",[22,212,357,382])
+                            saving=bool(self.v42a_cfg.get("g34_save_points",True)) and (
+                                not details or int(viewpoint.uid) in details)
+                            save_g34(os.path.join(self.save_dir,"v42a2_shadow"),
+                                     r34,raw_v42a.detach(),g0_v42a.detach(),
+                                     g1.detach(),g2.detach(),g3,g4,q_points,reasons_selected,
+                                     g34diag,idx2_valid.detach(),points_v42a.detach(),
+                                     save_points=saving)
+                            print("[V4.2a.2] KF={} G3vsG0={:.5f}m G4vsG0={:.5f}m "
+                                  "G4accepted={:.3f}".format(
+                                      viewpoint.uid,r34["g3_vs_g0_mean_m"],
+                                      r34["g4_vs_g0_mean_m"],r34["g4_accepted_fraction"]))
                         if v42a1_enabled:
                             sel = {key: (val[idx2_valid] if val.ndim > 0 and
                                         val.shape[0] == v42a1_all_reasons["reason"].shape[0]
