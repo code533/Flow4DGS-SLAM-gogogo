@@ -24,6 +24,7 @@ from scipy import ndimage as ndi
 import seaborn as sns
 from pytorch3d.ops import knn_points
 from utils.v42a_propagation import (bidirectional_flow_reliability, gather_prior_gaussian_confidence, knn_candidates_from_precomputed, displacement_stats, save_diagnostics)
+from utils.v42a1_diagnostics import projection_reasons, knn_motion_diagnostics, diagnostic_row, save_diag
 
 def print_lrs(optimizer, step, every=50):
     if step % every != 0:
@@ -1824,6 +1825,8 @@ class BackEnd(mp.Process):
         uvz = gaussians_uvz_coor_at_cam1.to(device)
         v42a_active = self.v42a_mode != "off" and self.use_knn
         v42a_diag = v42a_gauss_q = None
+        v42a1_all_reasons = None
+        v42a1_enabled = v42a_active and bool(self.v42a_cfg.get("attribute_failures", False))
         if v42a_active:
             if flow_back is None or flow.shape != flow_back.shape:
                 raise RuntimeError("V4.2a requires full-resolution paired mapping flow")
@@ -1839,6 +1842,8 @@ class BackEnd(mp.Process):
                     edge_rel=float(self.v42a_cfg.get("edge_rel", .06)),
                     edge_penalty=float(self.v42a_cfg.get("edge_penalty", .65)))
                 v42a_gauss_q = gather_prior_gaussian_confidence(uvz, q_map)
+                if v42a1_enabled:
+                    v42a1_all_reasons = projection_reasons(uvz, q_map, v42a_diag)
 
         
 
@@ -1931,6 +1936,33 @@ class BackEnd(mp.Process):
                             g2_min_support=float(self.v42a_cfg.get("min_support", .45)),
                             g2_min_neighbors=int(self.v42a_cfg.get("min_neighbors", 3)),
                             neighbor_q_min=float(self.v42a_cfg.get("neighbor_q_min", .3)))
+                        if v42a1_enabled:
+                            sel = {key: (val[idx2_valid] if val.ndim > 0 and
+                                        val.shape[0] == v42a1_all_reasons["reason"].shape[0]
+                                        else val)
+                                   for key, val in v42a1_all_reasons.items()}
+                            nb = knn_motion_diagnostics(
+                                raw_v42a.detach(), q_points,
+                                graph.dists.squeeze(0), graph.idx.squeeze(0),
+                                g0_v42a.detach(), g1, g2,
+                                radius=self.knn_r, sigma=.05,
+                                neighbor_q_min=float(self.v42a_cfg.get("neighbor_q_min", .3)),
+                                motion_mismatch_m=float(self.v42a_cfg.get("motion_mismatch_m", .1)),
+                                gate_m=.3)
+                            drow = diagnostic_row(viewpoint.uid, sel, idx2_valid,
+                                                  v42a1_all_reasons, nb, aux)
+                            selected_frames = self.v42a_cfg.get("detailed_frames", [22, 212, 357, 382])
+                            detail = bool(self.v42a_cfg.get("save_attribution_points", False)) and (
+                                not selected_frames or int(viewpoint.uid) in selected_frames)
+                            save_diag(os.path.join(self.save_dir, "v42a1_attribution"),
+                                      drow, sel, nb, points_v42a.detach(),
+                                      raw_v42a.detach(), g0_v42a.detach(), g1, g2,
+                                      idx2_valid.detach(), save_points=detail)
+                            print("[V4.2a.1] KF={} Qzero={:.3f} outside={:.3f} "
+                                  "gate_G0toG1_reject={}".format(
+                                      viewpoint.uid, drow["q_near_zero_fraction"],
+                                      drow["selected_reason_projection_outside_image_fraction"],
+                                      drow["g0_to_g1_new_rejections_n"]))
                         row = displacement_stats(viewpoint.uid, self.v42a_mode,
                             raw_v42a.detach(), g0_v42a.detach(), g1, g2,
                             q_points, aux, v42a_diag)
