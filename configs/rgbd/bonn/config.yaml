@@ -281,6 +281,11 @@ model_params:
     min_neighbors: 3
     neighbor_q_min: 0.3
     save_points: false
+    # V4.2a.1 read-only attribution: enable only with mode: shadow.
+    attribute_failures: false
+    save_attribution_points: false
+    detailed_frames: [22, 212, 357, 382]
+    motion_mismatch_m: 0.10
   use_knn: true
   white_background: false
 opt_params:
