@@ -17,9 +17,9 @@ class TestV42a1(unittest.TestCase):
         diag["prev_depth_valid"][0,0]=False
         out=projection_reasons(uv,q,diag)
         self.assertEqual(out["reason"].tolist(),[8,2,1,3])
-        self.assertTrue(torch.equal(out["q_sample"],torch.tensor([0.,0.,0.,1.]).where(
-            torch.tensor([True,True,True,False]),torch.tensor([0.,0.,0.,0.])) if False
-            else out["q_sample"].shape==(4,))
+        self.assertEqual(out["q_sample"].shape, (4,))
+        self.assertEqual(float(out["q_sample"][0]), 0.)
+        self.assertEqual(float(out["q_sample"][1]), 0.)
 
     def test_reasons_prioritize_preceding_invalidity(self):
         q=torch.ones(4,4)
