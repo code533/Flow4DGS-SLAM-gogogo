@@ -286,6 +286,16 @@ model_params:
     save_attribution_points: false
     detailed_frames: [22, 212, 357, 382]
     motion_mismatch_m: 0.10
+    # V4.2a.2: strict shadow-only proposals (actual map still uses G0).
+    g34_shadow: false
+    g34_save_points: true
+    g34_detailed_frames: [22, 212, 357, 382]
+    g4_motion_sigma_m: 0.08
+    g4_trusted_q: 0.30
+    g4_min_neighbors: 3
+    g4_min_support: 0.25
+    g4_max_dispersion_m: 0.12
+    g4_max_delta_from_g0_m: null
   use_knn: true
   white_background: false
 opt_params:
