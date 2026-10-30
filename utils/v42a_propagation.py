@@ -87,6 +87,12 @@ def bidirectional_flow_reliability(flow_prev_to_curr, flow_curr_to_prev,
         "correspondence_valid": valid,
         "depth_edge": depth_step,
         "out_of_bounds": ~in_bounds,
+        # Extra read-only visibility intermediates for V4.2a.1 diagnostics.
+        "prev_depth_valid": prev_depth_valid,
+        "forward_finite": finite,
+        "forward_in_bounds": in_bounds,
+        "backward_valid_warped": bwd_valid_sample,
+        "current_depth_valid_warped": curr_depth_warped,
     }
 
 
