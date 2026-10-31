@@ -26,6 +26,7 @@ from pytorch3d.ops import knn_points
 from utils.v42a_propagation import (bidirectional_flow_reliability, gather_prior_gaussian_confidence, knn_candidates_from_precomputed, displacement_stats, save_diagnostics)
 from utils.v42a1_diagnostics import projection_reasons, knn_motion_diagnostics, diagnostic_row, save_diag
 from utils.v42a2_propagation import shadow_g3_g4, g34_summary, save_g34
+from utils.v42a3_ablation import decompose_g4, summarize_ablation, save_ablation
 
 def print_lrs(optimizer, step, every=50):
     if step % every != 0:
@@ -1827,7 +1828,9 @@ class BackEnd(mp.Process):
         v42a_active = self.v42a_mode != "off" and self.use_knn
         v42a_diag = v42a_gauss_q = None
         v42a1_all_reasons = None
-        v42a2_enabled = v42a_active and bool(self.v42a_cfg.get("g34_shadow", False))
+        v42a3_enabled = v42a_active and bool(self.v42a_cfg.get("g4_ablation", False))
+        v42a2_enabled = v42a_active and (
+            bool(self.v42a_cfg.get("g34_shadow", False)) or v42a3_enabled)
         v42a1_enabled = v42a_active and (bool(self.v42a_cfg.get("attribute_failures", False)) or v42a2_enabled)
         if v42a2_enabled and self.v42a_mode != "shadow":
             raise ValueError("V4.2a.2 G3/G4 first release is SHADOW ONLY")
@@ -1953,6 +1956,34 @@ class BackEnd(mp.Process):
                                 min_support=float(self.v42a_cfg.get("g4_min_support",.25)),
                                 max_consensus_disagreement_m=float(self.v42a_cfg.get("g4_max_dispersion_m",.12)),
                                 max_delta_from_g0_m=self.v42a_cfg.get("g4_max_delta_from_g0_m",None))
+                            if v42a3_enabled:
+                                stage, gates, extra = decompose_g4(
+                                    raw_v42a.detach(), q_points,
+                                    graph.dists.squeeze(0), graph.idx.squeeze(0),
+                                    reasons_selected, g0_v42a.detach(),g3,g4,
+                                    {**g34diag, "g0":g0_v42a.detach()},
+                                    radius=self.knn_r, sigma=.05,
+                                    trusted_q=float(self.v42a_cfg.get("g4_trusted_q",.3)))
+                                ab_rows = summarize_ablation(
+                                    viewpoint.uid,stage,gates,
+                                    {"g0":g0_v42a.detach()},extra,gate=.3)
+                                ab_frames = self.v42a_cfg.get(
+                                    "g4_ablation_frames",[22,212,357,382])
+                                ab_save = bool(self.v42a_cfg.get(
+                                    "g4_ablation_save_points",True)) and (
+                                    not ab_frames or int(viewpoint.uid) in ab_frames)
+                                save_ablation(os.path.join(self.save_dir,"v42a3_ablation"),
+                                    ab_rows,stage,gates,extra,reasons_selected,
+                                    idx2_valid.detach(),points_v42a.detach(),
+                                    raw_v42a.detach(),q_points,
+                                    g0_v42a.detach(),g1.detach(),g2.detach(),
+                                    save_points=ab_save)
+                                print("[V4.2a.3] KF={} Support={:.3f} Soft={:.3f} "
+                                      "G4={:.3f} soft-v-support={:.5f}m".format(
+                                        viewpoint.uid,ab_rows[1]["accepted_fraction"],
+                                        ab_rows[2]["accepted_fraction"],
+                                        ab_rows[3]["accepted_fraction"],
+                                        ab_rows[3]["soft_vs_support_shared_mean_m"]))
                             r34=g34_summary(viewpoint.uid, self.v42a_mode,
                                             g0_v42a.detach(),g1.detach(),g3,g4,
                                             reasons_selected,g34diag)
