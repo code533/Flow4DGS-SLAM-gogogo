@@ -296,6 +296,10 @@ model_params:
     g4_min_support: 0.25
     g4_max_dispersion_m: 0.12
     g4_max_delta_from_g0_m: null
+    # V4.2a.3 paired mechanism ablation, SHADOW ONLY.
+    g4_ablation: false
+    g4_ablation_save_points: true
+    g4_ablation_frames: [22, 212, 357, 382]
   use_knn: true
   white_background: false
 opt_params:
