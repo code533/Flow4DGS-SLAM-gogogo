@@ -27,6 +27,9 @@ from utils.v42a_propagation import (bidirectional_flow_reliability, gather_prior
 from utils.v42a1_diagnostics import projection_reasons, knn_motion_diagnostics, diagnostic_row, save_diag
 from utils.v42a2_propagation import shadow_g3_g4, g34_summary, save_g34
 from utils.v42a3_ablation import decompose_g4, summarize_ablation, save_ablation
+from utils.v42b_online import (
+    ONLINE_MODES, validate_online_config, choose_online_motion,
+    online_row, append_online_row)
 
 def print_lrs(optimizer, step, every=50):
     if step % every != 0:
@@ -420,14 +423,15 @@ class BackEnd(mp.Process):
         self.knn_r = config["model_params"].get("knn_r", 0.2)
         self.v42a_cfg = config["model_params"].get("v42a_propagation", {})
         self.v42a_mode = str(self.v42a_cfg.get("mode", "off")).lower()
-        if self.v42a_mode not in ("off", "shadow", "g0", "g1", "g2"):
-            raise ValueError("V4.2a mode must be off/shadow/g0/g1/g2")
-        if self.v42a_mode in ("g1", "g2") and not self.use_knn:
-            raise ValueError("V4.2a G1/G2 requires use_knn: true")
+
         self.depth_check = config["model_params"].get("depth_check", False)
         self.sd = config["model_params"].get("sd", False)
 
         self.flow_ds = config["Training"].get("flow_ds", 1)
+        validate_online_config(
+            self.v42a_mode, self.v42a_cfg,
+            use_knn=self.use_knn, flow_offset=self.flow_offset,
+            dynamic_model=self.dynamic_model, flow_ds=self.flow_ds)
         self.insertion_type = config["model_params"].get("insertion_type", "new")
         self.iters = 200
 
@@ -1809,6 +1813,8 @@ class BackEnd(mp.Process):
         """
         Apply flow offset to the gaussians based on the flow between the current viewpoint and the closest keyframe.
         """
+        v42b_start = time.perf_counter()
+        v42b_ctx = None
         carnonical_xyz = self.gaussians.get_xyz.clone()[self.gaussians.dygs]
         xyz_at_t1 = carnonical_xyz.detach()  # Detach coordinates of Gaussians here
 
@@ -1828,12 +1834,16 @@ class BackEnd(mp.Process):
         v42a_active = self.v42a_mode != "off" and self.use_knn
         v42a_diag = v42a_gauss_q = None
         v42a1_all_reasons = None
+        v42b_online = self.v42a_mode in ONLINE_MODES
         v42a3_enabled = v42a_active and bool(self.v42a_cfg.get("g4_ablation", False))
-        v42a2_enabled = v42a_active and (
+        v42a2_log = v42a_active and (
             bool(self.v42a_cfg.get("g34_shadow", False)) or v42a3_enabled)
-        v42a1_enabled = v42a_active and (bool(self.v42a_cfg.get("attribute_failures", False)) or v42a2_enabled)
-        if v42a2_enabled and self.v42a_mode != "shadow":
-            raise ValueError("V4.2a.2 G3/G4 first release is SHADOW ONLY")
+        v42a2_enabled = v42a_active and (v42a2_log or v42b_online)
+        v42a1_log = v42a_active and (
+            bool(self.v42a_cfg.get("attribute_failures", False)) or v42a2_log)
+        v42a1_enabled = v42a_active and (v42a1_log or v42a2_enabled)
+        if v42a2_log and self.v42a_mode != "shadow":
+            raise ValueError("V4.2a Shadow diagnostics cannot be used during online modes")
         if v42a_active:
             if flow_back is None or flow.shape != flow_back.shape:
                 raise RuntimeError("V4.2a requires full-resolution paired mapping flow")
@@ -1984,22 +1994,42 @@ class BackEnd(mp.Process):
                                         ab_rows[2]["accepted_fraction"],
                                         ab_rows[3]["accepted_fraction"],
                                         ab_rows[3]["soft_vs_support_shared_mean_m"]))
-                            r34=g34_summary(viewpoint.uid, self.v42a_mode,
-                                            g0_v42a.detach(),g1.detach(),g3,g4,
-                                            reasons_selected,g34diag)
-                            details=self.v42a_cfg.get("g34_detailed_frames",[22,212,357,382])
-                            saving=bool(self.v42a_cfg.get("g34_save_points",True)) and (
-                                not details or int(viewpoint.uid) in details)
-                            save_g34(os.path.join(self.save_dir,"v42a2_shadow"),
-                                     r34,raw_v42a.detach(),g0_v42a.detach(),
-                                     g1.detach(),g2.detach(),g3,g4,q_points,reasons_selected,
-                                     g34diag,idx2_valid.detach(),points_v42a.detach(),
-                                     save_points=saving)
-                            print("[V4.2a.2] KF={} G3vsG0={:.5f}m G4vsG0={:.5f}m "
-                                  "G4accepted={:.3f}".format(
-                                      viewpoint.uid,r34["g3_vs_g0_mean_m"],
-                                      r34["g4_vs_g0_mean_m"],r34["g4_accepted_fraction"]))
-                        if v42a1_enabled:
+                            if v42b_online:
+                                stages_b, gates_b, _ = decompose_g4(
+                                    raw_v42a.detach(), q_points,
+                                    graph.dists.squeeze(0), graph.idx.squeeze(0),
+                                    reasons_selected, g0_v42a.detach(), g3, g4,
+                                    {**g34diag, "g0":g0_v42a.detach()},
+                                    radius=self.knn_r, sigma=.05,
+                                    trusted_q=float(self.v42a_cfg.get("g4_trusted_q", .3)))
+                                candidate_b = {
+                                    "g0":g0_v42a.detach(),
+                                    "g3":g3.detach(),
+                                    "g3_support":stages_b["support_only"].detach(),
+                                    "g4":g4.detach()}
+                                deformation = choose_online_motion(
+                                    self.v42a_mode, candidate_b)
+                                v42b_ctx = (g0_v42a.detach(), deformation, q_points,
+                                    reasons_selected, g3.detach(),
+                                    stages_b["support_only"].detach(), g4.detach(),
+                                    g34diag, gates_b)
+                            if v42a2_log:
+                                r34=g34_summary(viewpoint.uid, self.v42a_mode,
+                                                g0_v42a.detach(),g1.detach(),g3,g4,
+                                                reasons_selected,g34diag)
+                                details=self.v42a_cfg.get("g34_detailed_frames",[22,212,357,382])
+                                saving=bool(self.v42a_cfg.get("g34_save_points",True)) and (
+                                    not details or int(viewpoint.uid) in details)
+                                save_g34(os.path.join(self.save_dir,"v42a2_shadow"),
+                                         r34,raw_v42a.detach(),g0_v42a.detach(),
+                                         g1.detach(),g2.detach(),g3,g4,q_points,reasons_selected,
+                                         g34diag,idx2_valid.detach(),points_v42a.detach(),
+                                         save_points=saving)
+                                print("[V4.2a.2] KF={} G3vsG0={:.5f}m G4vsG0={:.5f}m "
+                                      "G4accepted={:.3f}".format(
+                                          viewpoint.uid,r34["g3_vs_g0_mean_m"],
+                                          r34["g4_vs_g0_mean_m"],r34["g4_accepted_fraction"]))
+                        if v42a1_log:
                             sel = {key: (val[idx2_valid] if val.ndim > 0 and
                                         val.shape[0] == v42a1_all_reasons["reason"].shape[0]
                                         else val)
@@ -2039,8 +2069,23 @@ class BackEnd(mp.Process):
                         if self.v42a_mode == "g1": deformation = g1
                         elif self.v42a_mode == "g2": deformation = g2
             
-            self.gaussians.update_delta_xyz(viewpoint.uid, closest_viewpoint.uid, deformation, idx2_valid, 
+            v42b_before_update = time.perf_counter()
+            self.gaussians.update_delta_xyz(viewpoint.uid, closest_viewpoint.uid, deformation, idx2_valid,
                                             max_motion=0.3)
+            if v42b_ctx is not None:
+                v42b_after_update = time.perf_counter()
+                row_b = online_row(
+                    viewpoint.uid, self.v42a_mode, *v42b_ctx,
+                    gate_m=.3, compute_ms=1000*(v42b_before_update-v42b_start),
+                    update_ms=1000*(v42b_after_update-v42b_before_update))
+                append_online_row(
+                    os.path.join(self.save_dir, "v42b_online"), row_b)
+                print("[V4.2b] KF={} mode={} points={} selected-vs-G0={:.5f}m "
+                      "new-reject={} gate-pass={:.3f}".format(
+                          viewpoint.uid, self.v42a_mode, row_b["n_points"],
+                          row_b["selected_vs_g0_mean_m"],
+                          row_b["new_gate_rejections_n"],
+                          row_b["selected_gate_pass_fraction"]))
 
         else:
             self.gaussians.update_delta_xyz(viewpoint.uid, closest_viewpoint.uid, None, idx2_valid, 
