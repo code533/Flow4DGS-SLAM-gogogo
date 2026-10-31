@@ -109,6 +109,14 @@ def shadow_g3_g4(raw, q, dists2, indices, g0, g1, reasons,
         valid_consensus &= (
             torch.linalg.vector_norm(estimate-g0,dim=-1)
             <=max_delta_from_g0_m)
+    # V4.2a.3 read-only decomposition: do not modify valid_consensus or g4.
+    support_only_gate = (v & (trusted_count >= min_trusted_neighbors) &
+                         (support >= min_support) & (tw.sum(-1) > 10 * eps))
+    soft_finite_gate = (robust_mass > 10 * eps) & torch.isfinite(estimate).all(-1)
+    delta_limit_gate = (torch.ones_like(v) if max_delta_from_g0_m is None
+                        else (torch.linalg.vector_norm(estimate-g0, dim=-1)
+                              <= max_delta_from_g0_m))
+    hard_dispersion_gate = dispersion <= max_consensus_disagreement_m
     g4=torch.where(valid_consensus[:,None],estimate,g0)
 
     norms=torch.stack([torch.linalg.vector_norm(g,dim=-1)
@@ -125,6 +133,13 @@ def shadow_g3_g4(raw, q, dists2, indices, g0, g1, reasons,
         "consensus_medoid_index":idx[rows,slot],
         "consensus_dispersion_m":dispersion,
         "g4_accepted":valid_consensus,
+        # These tensors expose the EXACT original G4 internal gates for the
+        # paired mechanism ablation; no recomputation of KNN or medoids.
+        "support_only_gate":support_only_gate,
+        "soft_finite_gate":soft_finite_gate,
+        "delta_limit_gate":delta_limit_gate,
+        "hard_dispersion_gate":hard_dispersion_gate,
+        "soft_candidate":estimate,
         "g3_fallback_visibility":~v,
         "g4_fallback_visibility":~v,
         "g4_fallback_consensus":v&~valid_consensus,
