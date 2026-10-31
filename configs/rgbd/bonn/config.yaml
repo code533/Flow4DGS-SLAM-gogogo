@@ -272,7 +272,7 @@ model_params:
   use_gmm_rot: true
   # V4.2a mapping ablation, disabled by default.
   v42a_propagation:
-    mode: 'off'   # off / shadow / g0 / g1 / g2 (quote off: YAML boolean trap)
+    mode: 'off'   # off / shadow / g0 / g1 / g2 / g3 / g3_support / g4
     fb_scale_px: 1.0
     edge_abs_m: 0.08
     edge_rel: 0.06
@@ -300,6 +300,8 @@ model_params:
     g4_ablation: false
     g4_ablation_save_points: true
     g4_ablation_frames: [22, 212, 357, 382]
+    # V4.2b online modes (G0 instrumented; original legacy mode is 'off').
+    online_trace: false
   use_knn: true
   white_background: false
 opt_params:
