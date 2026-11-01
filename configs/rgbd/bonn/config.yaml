@@ -302,6 +302,14 @@ model_params:
     g4_ablation_frames: [22, 212, 357, 382]
     # V4.2b online modes (G0 instrumented; original legacy mode is 'off').
     online_trace: false
+  # V4.3a: read-only paired render BEFORE online G0 update
+  v43a_observation:
+    enabled: false
+    every_n_keyframe: 5
+    detailed_frames: [212, 357]
+    save_maps: true
+    opacity_threshold: 0.1
+    uncovered_penalty_m: 0.5
   use_knn: true
   white_background: false
 opt_params:
