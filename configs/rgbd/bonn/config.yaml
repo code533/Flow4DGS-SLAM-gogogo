@@ -318,6 +318,10 @@ model_params:
     min_dynamic_depth_pixels: 16
     rgb_tolerance: 0.00001
     depth_tolerance_m: 0.0001
+    # V4.3a.2: optional frozen-map next-keyframe persistence check
+    temporal_enabled: false
+    temporal_source_frames: [207, 237, 247, 252, 317, 357, 412]
+    temporal_max_frame_gap: 12
   use_knn: true
   white_background: false
 opt_params:
