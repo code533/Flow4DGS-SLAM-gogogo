@@ -305,11 +305,19 @@ model_params:
   # V4.3a: read-only paired render BEFORE online G0 update
   v43a_observation:
     enabled: false
-    every_n_keyframe: 5
+    # Evaluate each eligible propagation event when 1; every 5th when 5.
+    every_n_keyframe: 1
     detailed_frames: [212, 357]
-    save_maps: true
+    save_maps: false
     opacity_threshold: 0.1
     uncovered_penalty_m: 0.5
+    region_analysis: false
+    grid_rows: 6
+    grid_cols: 8
+    min_dynamic_rgb_pixels: 64
+    min_dynamic_depth_pixels: 16
+    rgb_tolerance: 0.00001
+    depth_tolerance_m: 0.0001
   use_knn: true
   white_background: false
 opt_params:
