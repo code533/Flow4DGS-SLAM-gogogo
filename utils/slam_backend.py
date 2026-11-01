@@ -30,6 +30,7 @@ from utils.v42a3_ablation import decompose_g4, summarize_ablation, save_ablation
 from utils.v42b_online import (
     ONLINE_MODES, validate_online_config, choose_online_motion,
     online_row, append_online_row)
+from utils.v43a_observation_consistency import evaluate_hypotheses, save_evaluation
 
 def print_lrs(optimizer, step, every=50):
     if step % every != 0:
@@ -423,6 +424,13 @@ class BackEnd(mp.Process):
         self.knn_r = config["model_params"].get("knn_r", 0.2)
         self.v42a_cfg = config["model_params"].get("v42a_propagation", {})
         self.v42a_mode = str(self.v42a_cfg.get("mode", "off")).lower()
+        self.v43a_cfg = config["model_params"].get("v43a_observation", {})
+        self.v43a_enabled = bool(self.v43a_cfg.get("enabled", False))
+        if self.v43a_enabled:
+            if self.v42a_mode != "g0":
+                raise ValueError("V4.3a requires mode='g0' to preserve baseline Mapping")
+            if not (self.use_knn and self.flow_offset and self.dynamic_model == "offset"):
+                raise ValueError("V4.3a needs KNN, flow_offset and offset model")
 
         self.depth_check = config["model_params"].get("depth_check", False)
         self.sd = config["model_params"].get("sd", False)
@@ -1815,6 +1823,7 @@ class BackEnd(mp.Process):
         """
         v42b_start = time.perf_counter()
         v42b_ctx = None
+        v43a_ctx = None
         carnonical_xyz = self.gaussians.get_xyz.clone()[self.gaussians.dygs]
         xyz_at_t1 = carnonical_xyz.detach()  # Detach coordinates of Gaussians here
 
@@ -2009,6 +2018,14 @@ class BackEnd(mp.Process):
                                     "g4":g4.detach()}
                                 deformation = choose_online_motion(
                                     self.v42a_mode, candidate_b)
+                                if self.v43a_enabled:
+                                    v43a_ctx = {
+                                        "prior_keyframe_id":int(closest_viewpoint.uid),
+                                        "indices":idx2_valid.detach().clone(),
+                                        "candidates":{
+                                            "g0":g0_v42a.detach().clone(),
+                                            "g3_support":stages_b["support_only"].detach().clone(),
+                                            "g4":g4.detach().clone()}}
                                 v42b_ctx = (g0_v42a.detach(), deformation, q_points,
                                     reasons_selected, g3.detach(),
                                     stages_b["support_only"].detach(), g4.detach(),
@@ -2069,6 +2086,29 @@ class BackEnd(mp.Process):
                         if self.v42a_mode == "g1": deformation = g1
                         elif self.v42a_mode == "g2": deformation = g2
             
+            if self.v43a_enabled and v43a_ctx is not None:
+                should_run = (int(viewpoint.uid) % int(self.v43a_cfg.get("every_n_keyframe",5)) == 0)
+                requested = self.v43a_cfg.get("detailed_frames",[212,357])
+                should_save = (not requested or int(viewpoint.uid) in requested)
+                if should_run or should_save:
+                    prior = self.gaussians.get_delta_xyz(
+                        self.gaussians.kf_list.index(closest_viewpoint.uid))
+                    report,images = evaluate_hypotheses(
+                        frame_id=int(viewpoint.uid),pc=self.gaussians,viewpoint=viewpoint,
+                        prior_keyframe_id=int(closest_viewpoint.uid),
+                        prev_delta=prior, selected_indices=v43a_ctx["indices"],
+                        candidates=v43a_ctx["candidates"],
+                        render_fn=render, pipeline=self.pipeline_params,
+                        background=self.background,
+                        opacity_threshold=float(self.v43a_cfg.get("opacity_threshold",.1)),
+                        uncovered_penalty_m=float(self.v43a_cfg.get("uncovered_penalty_m",.5)),
+                        save_maps=bool(self.v43a_cfg.get("save_maps",True)) and should_save)
+                    save_evaluation(os.path.join(self.save_dir,"v43a_observation"),report,images)
+                    by_h = {row["hypothesis"]:row for row in report}
+                    print("[V4.3a] KF={} G0RGB={:.5f} SupportRGB={:.5f} G4RGB={:.5f}".format(
+                        viewpoint.uid,by_h["g0"]["dynamic_rgb_mae"],
+                        by_h["g3_support"]["dynamic_rgb_mae"],
+                        by_h["g4"]["dynamic_rgb_mae"]))
             v42b_before_update = time.perf_counter()
             self.gaussians.update_delta_xyz(viewpoint.uid, closest_viewpoint.uid, deformation, idx2_valid,
                                             max_motion=0.3)
