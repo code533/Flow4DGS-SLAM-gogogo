@@ -31,6 +31,7 @@ from utils.v42b_online import (
     ONLINE_MODES, validate_online_config, choose_online_motion,
     online_row, append_online_row)
 from utils.v43a_observation_consistency import evaluate_hypotheses, save_evaluation
+from utils.v43a1_region_analysis import eligible_keyframe, analyze_paired_regions, save_region_analysis
 
 def print_lrs(optimizer, step, every=50):
     if step % every != 0:
@@ -426,6 +427,10 @@ class BackEnd(mp.Process):
         self.v42a_mode = str(self.v42a_cfg.get("mode", "off")).lower()
         self.v43a_cfg = config["model_params"].get("v43a_observation", {})
         self.v43a_enabled = bool(self.v43a_cfg.get("enabled", False))
+        self.v43a_eligible_events = 0
+        self.v43a1_regions = bool(self.v43a_cfg.get("region_analysis", False))
+        if self.v43a_enabled and int(self.v43a_cfg.get("every_n_keyframe", 5)) < 1:
+            raise ValueError("V4.3a.1 every_n_keyframe must be positive")
         if self.v43a_enabled:
             if self.v42a_mode != "g0":
                 raise ValueError("V4.3a requires mode='g0' to preserve baseline Mapping")
@@ -2087,7 +2092,10 @@ class BackEnd(mp.Process):
                         elif self.v42a_mode == "g2": deformation = g2
             
             if self.v43a_enabled and v43a_ctx is not None:
-                should_run = (int(viewpoint.uid) % int(self.v43a_cfg.get("every_n_keyframe",5)) == 0)
+                self.v43a_eligible_events += 1
+                event_num = self.v43a_eligible_events
+                should_run = eligible_keyframe(
+                    event_num,int(self.v43a_cfg.get("every_n_keyframe",5)))
                 requested = self.v43a_cfg.get("detailed_frames",[212,357])
                 should_save = (not requested or int(viewpoint.uid) in requested)
                 if should_run or should_save:
@@ -2102,8 +2110,31 @@ class BackEnd(mp.Process):
                         background=self.background,
                         opacity_threshold=float(self.v43a_cfg.get("opacity_threshold",.1)),
                         uncovered_penalty_m=float(self.v43a_cfg.get("uncovered_penalty_m",.5)),
-                        save_maps=bool(self.v43a_cfg.get("save_maps",True)) and should_save)
-                    save_evaluation(os.path.join(self.save_dir,"v43a_observation"),report,images)
+                        save_maps=(self.v43a1_regions or (bool(self.v43a_cfg.get("save_maps",True)) and should_save)))
+                    if self.v43a1_regions:
+                        from utils.v43a_observation_consistency import HYPOTHESES
+                        # Analysis operates in CPU numpy on the three score
+                        # maps. Keep full-resolution maps only for detailed
+                        # frames, as in the original V4.3a.
+                        rmaps = {name:{
+                            key:images[name][key] for key in (
+                                "rgb_abs_mean","depth_penalized_abs",
+                                "prediction_covered","dynamic_region",
+                                "gt_depth_valid","gt_rgb_valid")}
+                            for name in HYPOTHESES}
+                        frame_rows,tile_rows = analyze_paired_regions(
+                            rmaps,frame_id=int(viewpoint.uid),
+                            event_index=event_num,
+                            grid_rows=int(self.v43a_cfg.get("grid_rows",6)),
+                            grid_cols=int(self.v43a_cfg.get("grid_cols",8)),
+                            min_dynamic_rgb_pixels=int(self.v43a_cfg.get("min_dynamic_rgb_pixels",64)),
+                            min_dynamic_depth_pixels=int(self.v43a_cfg.get("min_dynamic_depth_pixels",16)),
+                            rgb_tolerance=float(self.v43a_cfg.get("rgb_tolerance",1e-5)),
+                            depth_tolerance_m=float(self.v43a_cfg.get("depth_tolerance_m",1e-4)))
+                        save_region_analysis(
+                            os.path.join(self.save_dir,"v43a1_regions"),frame_rows,tile_rows)
+                    save_evaluation(os.path.join(self.save_dir,"v43a_observation"),
+                        report,images if bool(self.v43a_cfg.get("save_maps",False)) and should_save else None)
                     by_h = {row["hypothesis"]:row for row in report}
                     print("[V4.3a] KF={} G0RGB={:.5f} SupportRGB={:.5f} G4RGB={:.5f}".format(
                         viewpoint.uid,by_h["g0"]["dynamic_rgb_mae"],
