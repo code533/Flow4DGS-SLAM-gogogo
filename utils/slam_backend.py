@@ -32,6 +32,9 @@ from utils.v42b_online import (
     online_row, append_online_row)
 from utils.v43a_observation_consistency import evaluate_hypotheses, save_evaluation
 from utils.v43a1_region_analysis import eligible_keyframe, analyze_paired_regions, save_region_analysis
+from utils.v43a2_temporal import (
+    validate_future_settings, capture_frozen_source,
+    evaluate_frozen_future, append_future_rows)
 
 def print_lrs(optimizer, step, every=50):
     if step % every != 0:
@@ -429,6 +432,15 @@ class BackEnd(mp.Process):
         self.v43a_enabled = bool(self.v43a_cfg.get("enabled", False))
         self.v43a_eligible_events = 0
         self.v43a1_regions = bool(self.v43a_cfg.get("region_analysis", False))
+        self.v43a2_temporal = bool(self.v43a_cfg.get("temporal_enabled", False))
+        self.v43a2_source_frames = self.v43a_cfg.get(
+            "temporal_source_frames", [207,237,247,252,317,357,412])
+        self.v43a2_pending = None
+        validate_future_settings(self.v43a2_temporal,
+                                 self.v43a2_source_frames,
+                                 int(self.v43a_cfg.get("temporal_max_frame_gap",12)))
+        if self.v43a2_temporal and not self.v43a_enabled:
+            raise ValueError("V4.3a.2 temporal needs v43a_observation.enabled=true")
         if self.v43a_enabled and int(self.v43a_cfg.get("every_n_keyframe", 5)) < 1:
             raise ValueError("V4.3a.1 every_n_keyframe must be positive")
         if self.v43a_enabled:
@@ -2133,6 +2145,23 @@ class BackEnd(mp.Process):
                             depth_tolerance_m=float(self.v43a_cfg.get("depth_tolerance_m",1e-4)))
                         save_region_analysis(
                             os.path.join(self.save_dir,"v43a1_regions"),frame_rows,tile_rows)
+                    if (self.v43a2_temporal and
+                            int(viewpoint.uid) in self.v43a2_source_frames):
+                        # Deep copy exactly this pre-G0, pre-Mapping map state.
+                        # Only one pending snapshot is ever retained. The next
+                        # keyframe is evaluated *before* changing online map.
+                        self.v43a2_pending = capture_frozen_source(
+                            self.gaussians,
+                            source_uid=int(viewpoint.uid),
+                            prior_uid=int(closest_viewpoint.uid),
+                            event_index=event_num,
+                            prev_delta=prior,
+                            indices=v43a_ctx["indices"],
+                            candidates=v43a_ctx["candidates"],
+                            current_rows=report,
+                            clone_fn=clone_obj)
+                        print("[V4.3a.2] Frozen pre-Mapping map at KF={} "
+                              "for next-keyframe persistence check".format(viewpoint.uid))
                     save_evaluation(os.path.join(self.save_dir,"v43a_observation"),
                         report,images if bool(self.v43a_cfg.get("save_maps",False)) and should_save else None)
                     by_h = {row["hypothesis"]:row for row in report}
@@ -2293,6 +2322,32 @@ class BackEnd(mp.Process):
                     add_new_gaussian = data[5]
                     dynamic_render = data[6]
 
+                    if self.v43a2_pending is not None:
+                        # Consume BEFORE adding keyframe, inserting Gaussians,
+                        # updating any time offset or running Mapping.
+                        pending = self.v43a2_pending
+                        self.v43a2_pending = None
+                        gap = int(viewpoint.uid) - pending["source_uid"]
+                        max_gap = int(self.v43a_cfg.get("temporal_max_frame_gap",12))
+                        if 0 < gap <= max_gap:
+                            future_rows = evaluate_frozen_future(
+                                pending, viewpoint,render_fn=render,
+                                pipeline=self.pipeline_params,background=self.background,
+                                max_frame_gap=max_gap,
+                                opacity_threshold=float(self.v43a_cfg.get("opacity_threshold",.1)),
+                                uncovered_penalty_m=float(self.v43a_cfg.get("uncovered_penalty_m",.5)),
+                                rgb_tolerance=float(self.v43a_cfg.get("rgb_tolerance",1e-5)),
+                                depth_tolerance_m=float(self.v43a_cfg.get("depth_tolerance_m",1e-4)))
+                            append_future_rows(os.path.join(
+                                self.save_dir,"v43a2_temporal"),future_rows)
+                            print("[V4.3a.2] Source KF={} heldout KF={} "
+                                  "zero-order-hold completed".format(
+                                    pending["source_uid"],int(viewpoint.uid)))
+                        else:
+                            print("[V4.3a.2] Skipped heldout: source={} next={} "
+                                  "gap={} max_gap={}".format(
+                                    pending["source_uid"],int(viewpoint.uid),gap,max_gap))
+                        del pending
                     self.viewpoints[cur_frame_idx] = viewpoint
                     self.current_window = current_window
                     flow_back = None
