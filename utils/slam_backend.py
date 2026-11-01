@@ -2330,19 +2330,28 @@ class BackEnd(mp.Process):
                         gap = int(viewpoint.uid) - pending["source_uid"]
                         max_gap = int(self.v43a_cfg.get("temporal_max_frame_gap",12))
                         if 0 < gap <= max_gap:
-                            future_rows = evaluate_frozen_future(
-                                pending, viewpoint,render_fn=render,
-                                pipeline=self.pipeline_params,background=self.background,
-                                max_frame_gap=max_gap,
-                                opacity_threshold=float(self.v43a_cfg.get("opacity_threshold",.1)),
-                                uncovered_penalty_m=float(self.v43a_cfg.get("uncovered_penalty_m",.5)),
-                                rgb_tolerance=float(self.v43a_cfg.get("rgb_tolerance",1e-5)),
-                                depth_tolerance_m=float(self.v43a_cfg.get("depth_tolerance_m",1e-4)))
-                            append_future_rows(os.path.join(
-                                self.save_dir,"v43a2_temporal"),future_rows)
-                            print("[V4.3a.2] Source KF={} heldout KF={} "
-                                  "zero-order-hold completed".format(
-                                    pending["source_uid"],int(viewpoint.uid)))
+                            try:
+                                future_rows = evaluate_frozen_future(
+                                    pending, viewpoint,render_fn=render,
+                                    pipeline=self.pipeline_params,background=self.background,
+                                    max_frame_gap=max_gap,
+                                    opacity_threshold=float(self.v43a_cfg.get("opacity_threshold",.1)),
+                                    uncovered_penalty_m=float(self.v43a_cfg.get("uncovered_penalty_m",.5)),
+                                    rgb_tolerance=float(self.v43a_cfg.get("rgb_tolerance",1e-5)),
+                                    depth_tolerance_m=float(self.v43a_cfg.get("depth_tolerance_m",1e-4)))
+                            except ValueError as exc:
+                                # Empty dynamic target is an expected
+                                # diagnostic omission, not a Mapping failure.
+                                if "Empty source/future dynamic observation region" not in str(exc):
+                                    raise
+                                print("[V4.3a.2] Skipping heldout pair {}->{}: {}".format(
+                                    pending["source_uid"],int(viewpoint.uid),exc))
+                            else:
+                                append_future_rows(os.path.join(
+                                    self.save_dir,"v43a2_temporal"),future_rows)
+                                print("[V4.3a.2] Source KF={} heldout KF={} "
+                                      "zero-order-hold completed".format(
+                                        pending["source_uid"],int(viewpoint.uid)))
                         else:
                             print("[V4.3a.2] Skipped heldout: source={} next={} "
                                   "gap={} max_gap={}".format(
