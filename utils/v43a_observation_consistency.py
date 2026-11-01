@@ -115,6 +115,7 @@ def score_rgbd(image, depth, opacity, gt_rgb, gt_depth, dynamic_region,
         "prediction_covered":predicted.detach(),
         "dynamic_region":dynamic.detach(),
         "gt_depth_valid":depth_obs.detach(),
+        "gt_rgb_valid":rgb_observed.detach(),
     }
 
 
