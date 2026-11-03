@@ -1,0 +1,5 @@
+# V5.1a strict: reject source/target out-of-FOV and rerun G0 KNN smoothing.
+inherit_from: "configs/rgbd/bonn/v51a_balloon2_common.yaml"
+model_params:
+  v51a_projection:
+    mode: 'strict'
