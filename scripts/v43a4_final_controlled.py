@@ -259,6 +259,8 @@ def run_control(holdout_csv,holdout_config,output,development_csv=None):
         samples.append(evaluate_pairs(heldout,margin,"heldout"))
     if development_csv is not None:
         development_csv=Path(development_csv)
+        if digest(holdout_csv)==digest(development_csv):
+            raise ValueError("Holdout and development candidate-score CSVs are identical")
         train=read_scores(development_csv)
         for margin in (PRIMARY_MARGIN_M,SECONDARY_MARGIN_M):
             samples.append(evaluate_pairs(train,margin,"development"))
