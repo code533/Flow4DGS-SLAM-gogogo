@@ -2055,7 +2055,7 @@ class BackEnd(mp.Process):
                             strict_raw = raw_v42a[v51a_keep]
                             v51a_strict_g0 = self.smooth_deformation_knn_radius(
                                 points=strict_points, deform=strict_raw,
-                                k=self.knn_n, r_max=self.knn_r,
+                                k=min(self.knn_n,len(strict_points)), r_max=self.knn_r,
                                 weighting="gaussian", sigma=0.05,
                                 include_self=True, eps=1e-8)
                         else:
@@ -2361,6 +2361,9 @@ class BackEnd(mp.Process):
                 # previous offset. Do not globally alter projection/RAFT.
                 idx2_valid = v51a_strict_indices
                 deformation = v51a_strict_g0
+                # V4.2b's historic trace describes the LEGACY candidate
+                # and would mislabel this strict online update.
+                v42b_ctx = None
             v42b_before_update = time.perf_counter()
             self.gaussians.update_delta_xyz(viewpoint.uid, closest_viewpoint.uid, deformation, idx2_valid,
                                             max_motion=0.3)
