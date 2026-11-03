@@ -1,0 +1,19 @@
+# FINAL one-shot independent-scene test, not a tuning run.
+# This inherits the already simplified full Balloon2 protocol and changes
+# ONLY the Bonn scene and common source-switch threshold.
+inherit_from: "configs/rgbd/bonn/v43a4_balloon2_full.yaml"
+
+Dataset:
+  # Different sequence from development source (rgbd_bonn_balloon2).
+  dataset_path: "datasets/bonn/rgbd_bonn_balloon"
+
+model_params:
+  v43a_observation:
+    # Primary preregistered comparison: no absolute margin, so the
+    # clipped score is not handicapped by the old 0.2mm raw-scale gate.
+    # 0.2mm is audited offline as a SECONDARY sensitivity test.
+    predictive_decision_margin_m: 0.0
+    predictive_source_every_n_event: 4
+    predictive_max_sources: 25
+    temporal_source_frames: [9999]
+    predictive_save_future_maps: false
