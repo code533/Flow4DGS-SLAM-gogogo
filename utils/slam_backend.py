@@ -35,6 +35,9 @@ from utils.v43a1_region_analysis import eligible_keyframe, analyze_paired_region
 from utils.v43a2_temporal import (
     validate_future_settings, capture_frozen_source,
     evaluate_frozen_future, append_future_rows)
+from utils.v43a4_predictive import (
+    is_systematic_source, validate_protocol, score_from_maps,
+    audit_source_future, save_policy_results)
 
 def print_lrs(optimizer, step, every=50):
     if step % every != 0:
@@ -436,6 +439,25 @@ class BackEnd(mp.Process):
         self.v43a2_source_frames = self.v43a_cfg.get(
             "temporal_source_frames", [207,237,247,252,317,357,412])
         self.v43a2_pending = None
+        self.v43a4_enabled = bool(self.v43a_cfg.get("predictive_enabled", False))
+        self.v43a4_event_every = int(self.v43a_cfg.get("predictive_source_every_n_event", 10))
+        self.v43a4_max_sources = int(self.v43a_cfg.get("predictive_max_sources", 25))
+        self.v43a4_sources_captured = 0
+        if self.v43a4_enabled:
+            if not self.v43a2_temporal:
+                raise ValueError("V4.3a.4 predictive_enabled needs temporal_enabled")
+            validate_protocol(
+                self.v43a4_event_every,
+                float(self.v43a_cfg.get("predictive_decision_margin_m",.0002)),
+                float(self.v43a_cfg.get("predictive_future_tie_tol_m",.0001)),
+                float(self.v43a_cfg.get("predictive_clip_m",.05)),
+                float(self.v43a_cfg.get("predictive_huber_delta_m",.02)),
+                int(self.v43a_cfg.get("predictive_interior_erosion_px",5)),
+                int(self.v43a_cfg.get("predictive_min_dynamic_depth_pixels",256)),
+                int(self.v43a_cfg.get("predictive_min_interior_depth_pixels",64)),
+                float(self.v43a_cfg.get("predictive_min_coverage_fraction",.95)))
+            if self.v43a4_event_every < 1 or self.v43a4_max_sources < 1:
+                raise ValueError("V4.3a.4 requires positive source interval and source cap")
         validate_future_settings(self.v43a2_temporal,
                                  self.v43a2_source_frames,
                                  int(self.v43a_cfg.get("temporal_max_frame_gap",12)))
@@ -2110,7 +2132,11 @@ class BackEnd(mp.Process):
                     event_num,int(self.v43a_cfg.get("every_n_keyframe",5)))
                 requested = self.v43a_cfg.get("detailed_frames",[212,357])
                 should_save = (not requested or int(viewpoint.uid) in requested)
-                if should_run or should_save:
+                should_predict = (
+                    self.v43a4_enabled
+                    and self.v43a4_sources_captured < self.v43a4_max_sources
+                    and is_systematic_source(event_num,self.v43a4_event_every))
+                if should_run or should_save or should_predict:
                     prior = self.gaussians.get_delta_xyz(
                         self.gaussians.kf_list.index(closest_viewpoint.uid))
                     report,images = evaluate_hypotheses(
@@ -2122,7 +2148,8 @@ class BackEnd(mp.Process):
                         background=self.background,
                         opacity_threshold=float(self.v43a_cfg.get("opacity_threshold",.1)),
                         uncovered_penalty_m=float(self.v43a_cfg.get("uncovered_penalty_m",.5)),
-                        save_maps=(self.v43a1_regions or (bool(self.v43a_cfg.get("save_maps",True)) and should_save)))
+                        save_maps=(self.v43a1_regions or should_predict or
+                                   (bool(self.v43a_cfg.get("save_maps",True)) and should_save)))
                     if self.v43a1_regions:
                         from utils.v43a_observation_consistency import HYPOTHESES
                         # Analysis operates in CPU numpy on the three score
@@ -2146,22 +2173,47 @@ class BackEnd(mp.Process):
                         save_region_analysis(
                             os.path.join(self.save_dir,"v43a1_regions"),frame_rows,tile_rows)
                     if (self.v43a2_temporal and
-                            int(viewpoint.uid) in self.v43a2_source_frames):
-                        # Deep copy exactly this pre-G0, pre-Mapping map state.
-                        # Only one pending snapshot is ever retained. The next
-                        # keyframe is evaluated *before* changing online map.
-                        self.v43a2_pending = capture_frozen_source(
-                            self.gaussians,
-                            source_uid=int(viewpoint.uid),
-                            prior_uid=int(closest_viewpoint.uid),
-                            event_index=event_num,
-                            prev_delta=prior,
-                            indices=v43a_ctx["indices"],
-                            candidates=v43a_ctx["candidates"],
-                            current_rows=report,
-                            clone_fn=clone_obj)
-                        print("[V4.3a.2] Frozen pre-Mapping map at KF={} "
-                              "for next-keyframe persistence check".format(viewpoint.uid))
+                            (int(viewpoint.uid) in self.v43a2_source_frames or should_predict)):
+                        predictive_source_scores = None
+                        if should_predict:
+                            try:
+                                predictive_source_scores = score_from_maps(
+                                    images,
+                                    clip_m=float(self.v43a_cfg.get("predictive_clip_m",.05)),
+                                    huber_delta_m=float(self.v43a_cfg.get("predictive_huber_delta_m",.02)),
+                                    interior_erosion_px=int(self.v43a_cfg.get("predictive_interior_erosion_px",5)),
+                                    min_dynamic_depth_pixels=int(self.v43a_cfg.get("predictive_min_dynamic_depth_pixels",256)),
+                                    min_interior_depth_pixels=int(self.v43a_cfg.get("predictive_min_interior_depth_pixels",64)))
+                                if (min(v["depth_coverage"] for v in predictive_source_scores.values())
+                                      < float(self.v43a_cfg.get("predictive_min_coverage_fraction",.95))):
+                                    raise ValueError("Insufficient source depth coverage")
+                            except ValueError as exc:
+                                print("[V4.3a.4] Source KF={} skipped: {}".format(viewpoint.uid,exc))
+                                should_predict=False
+                                if int(viewpoint.uid) not in self.v43a2_source_frames:
+                                    predictive_source_scores=None
+                        if (not should_predict and
+                                int(viewpoint.uid) not in self.v43a2_source_frames):
+                            pass
+                        else:
+                            # Deep copy exactly this pre-G0, pre-Mapping map state.
+                            # Only one pending snapshot is ever retained. The next
+                            # keyframe is evaluated *before* changing online map.
+                            self.v43a2_pending = capture_frozen_source(
+                                self.gaussians,
+                                source_uid=int(viewpoint.uid),
+                                prior_uid=int(closest_viewpoint.uid),
+                                event_index=event_num,
+                                prev_delta=prior,
+                                indices=v43a_ctx["indices"],
+                                candidates=v43a_ctx["candidates"],
+                                current_rows=report,
+                                clone_fn=clone_obj)
+                            print("[V4.3a.2] Frozen pre-Mapping map at KF={} "
+                                  "for next-keyframe persistence check".format(viewpoint.uid))
+                            if should_predict and predictive_source_scores is not None:
+                                self.v43a2_pending["v43a4_source_scores"] = predictive_source_scores
+                                self.v43a4_sources_captured += 1
                     save_evaluation(os.path.join(self.save_dir,"v43a_observation"),
                         report,images if bool(self.v43a_cfg.get("save_maps",False)) and should_save else None)
                     by_h = {row["hypothesis"]:row for row in report}
@@ -2331,14 +2383,19 @@ class BackEnd(mp.Process):
                         max_gap = int(self.v43a_cfg.get("temporal_max_frame_gap",12))
                         if 0 < gap <= max_gap:
                             try:
-                                future_rows = evaluate_frozen_future(
+                                future_output = evaluate_frozen_future(
                                     pending, viewpoint,render_fn=render,
                                     pipeline=self.pipeline_params,background=self.background,
                                     max_frame_gap=max_gap,
                                     opacity_threshold=float(self.v43a_cfg.get("opacity_threshold",.1)),
                                     uncovered_penalty_m=float(self.v43a_cfg.get("uncovered_penalty_m",.5)),
                                     rgb_tolerance=float(self.v43a_cfg.get("rgb_tolerance",1e-5)),
-                                    depth_tolerance_m=float(self.v43a_cfg.get("depth_tolerance_m",1e-4)))
+                                    depth_tolerance_m=float(self.v43a_cfg.get("depth_tolerance_m",1e-4)),
+                                    return_maps="v43a4_source_scores" in pending)
+                                if "v43a4_source_scores" in pending:
+                                    future_rows, future_maps = future_output
+                                else:
+                                    future_rows = future_output
                             except ValueError as exc:
                                 # Empty dynamic target is an expected
                                 # diagnostic omission, not a Mapping failure.
@@ -2347,6 +2404,37 @@ class BackEnd(mp.Process):
                                 print("[V4.3a.2] Skipping heldout pair {}->{}: {}".format(
                                     pending["source_uid"],int(viewpoint.uid),exc))
                             else:
+                                if "v43a4_source_scores" in pending:
+                                    try:
+                                        future_scores=score_from_maps(
+                                            future_maps,
+                                            clip_m=float(self.v43a_cfg.get("predictive_clip_m",.05)),
+                                            huber_delta_m=float(self.v43a_cfg.get("predictive_huber_delta_m",.02)),
+                                            interior_erosion_px=int(self.v43a_cfg.get("predictive_interior_erosion_px",5)),
+                                            min_dynamic_depth_pixels=int(self.v43a_cfg.get("predictive_min_dynamic_depth_pixels",256)),
+                                            min_interior_depth_pixels=int(self.v43a_cfg.get("predictive_min_interior_depth_pixels",64)))
+                                        if (min(v["depth_coverage"] for v in future_scores.values())
+                                              < float(self.v43a_cfg.get("predictive_min_coverage_fraction",.95))):
+                                            raise ValueError("Insufficient future depth coverage")
+                                    except ValueError as exc:
+                                        print("[V4.3a.4] Pair {}->{} skipped: {}".format(
+                                            pending["source_uid"],int(viewpoint.uid),exc))
+                                    else:
+                                        paired_rows=audit_source_future(
+                                            pending["v43a4_source_scores"],future_scores,
+                                            source_uid=pending["source_uid"],
+                                            future_uid=int(viewpoint.uid),
+                                            event_index=pending["event_index"],
+                                            decision_margin_m=float(self.v43a_cfg.get("predictive_decision_margin_m",.0002)),
+                                            future_tie_tol_m=float(self.v43a_cfg.get("predictive_future_tie_tol_m",.0001)),
+                                            coverage_tolerance=float(self.v43a_cfg.get("predictive_coverage_tolerance",.005)))
+                                        save_policy_results(
+                                            os.path.join(self.save_dir,"v43a4_predictive"),
+                                            paired_rows,pending["v43a4_source_scores"],future_scores,
+                                            future_maps if bool(self.v43a_cfg.get("predictive_save_future_maps",False)) else None)
+                                        print("[V4.3a.4] pair {}->{} MAE picked {} Robust50 picked {}".format(
+                                            pending["source_uid"],int(viewpoint.uid),
+                                            paired_rows[1]["selected"],paired_rows[2]["selected"]))
                                 append_future_rows(os.path.join(
                                     self.save_dir,"v43a2_temporal"),future_rows)
                                 print("[V4.3a.2] Source KF={} heldout KF={} "
