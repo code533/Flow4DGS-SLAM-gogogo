@@ -1,0 +1,6 @@
+# Full V4.3a.4 experiment: systematic samples across balloon2.
+inherit_from: "configs/rgbd/bonn/v43a4_balloon2_common.yaml"
+model_params:
+  v43a_observation:
+    predictive_source_every_n_event: 4
+    predictive_max_sources: 25
