@@ -1,0 +1,5 @@
+# V5.1a shadow: compare, but ONLY update with unchanged legacy G0.
+inherit_from: "configs/rgbd/bonn/v51a_balloon2_common.yaml"
+model_params:
+  v51a_projection:
+    mode: 'shadow'
