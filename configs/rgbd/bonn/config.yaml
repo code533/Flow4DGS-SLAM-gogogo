@@ -322,6 +322,20 @@ model_params:
     temporal_enabled: false
     temporal_source_frames: [207, 237, 247, 252, 317, 357, 412]
     temporal_max_frame_gap: 12
+    # V4.3a.4 preregistered source -> next-keyframe robust predictor
+    predictive_enabled: false
+    predictive_source_every_n_event: 10
+    predictive_max_sources: 25
+    predictive_min_dynamic_depth_pixels: 256
+    predictive_min_interior_depth_pixels: 64
+    predictive_interior_erosion_px: 5
+    predictive_clip_m: 0.05
+    predictive_huber_delta_m: 0.02
+    predictive_decision_margin_m: 0.0002
+    predictive_future_tie_tol_m: 0.0001
+    predictive_coverage_tolerance: 0.005
+    predictive_min_coverage_fraction: 0.95
+    predictive_save_future_maps: false
   use_knn: true
   white_background: false
 opt_params:
