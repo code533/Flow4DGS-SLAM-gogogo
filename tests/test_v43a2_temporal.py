@@ -48,6 +48,12 @@ class TemporalTest(unittest.TestCase):
         self.assertEqual(len(rows),2)
         self.assertEqual(rows[0]["future_keyframe_id"],27)
         self.assertEqual(rows[0]["temporal_model"],"zero_order_hold_offsets")
+        rows_with_maps,future_maps=evaluate_frozen_future(
+            pending,cam,render_fn=fake_render,pipeline=None,
+            background=None,max_frame_gap=12,return_maps=True)
+        self.assertEqual(rows_with_maps,rows)
+        self.assertEqual(set(future_maps),set(HYPOTHESES))
+        self.assertEqual(future_maps["g0"]["depth_penalized_abs"].shape,(2,2))
         torch.testing.assert_close(model._delta_xyz[0],delta)
         with self.assertRaises(ValueError):
             evaluate_frozen_future(pending,SimpleNamespace(uid=40),
