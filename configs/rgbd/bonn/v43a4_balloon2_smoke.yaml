@@ -1,0 +1,6 @@
+# First-run V4.3a.4 experiment. TWO frozen source snapshots at most.
+inherit_from: "configs/rgbd/bonn/v43a4_balloon2_common.yaml"
+model_params:
+  v43a_observation:
+    predictive_source_every_n_event: 5
+    predictive_max_sources: 2
