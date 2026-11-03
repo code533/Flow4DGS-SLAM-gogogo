@@ -40,6 +40,11 @@ from utils.v43a4_predictive import (
     audit_source_future, save_policy_results)
 from utils.v50_motion_attribution import (
     eligible_event as v50_eligible_event, summarize_v50, append_v50)
+from utils.v51a_strict_projection import (
+    validate_mode as validate_v51a_mode, strict_ndc_valid,
+    strict_indices as v51a_filter_indices,
+    compare_candidates as compare_v51a_candidates,
+    append_comparison as append_v51a_comparison)
 
 def print_lrs(optimizer, step, every=50):
     if step % every != 0:
@@ -433,6 +438,8 @@ class BackEnd(mp.Process):
         self.knn_r = config["model_params"].get("knn_r", 0.2)
         self.v42a_cfg = config["model_params"].get("v42a_propagation", {})
         self.v42a_mode = str(self.v42a_cfg.get("mode", "off")).lower()
+        self.v51a_cfg = config["model_params"].get("v51a_projection", {})
+        self.v51a_mode = str(self.v51a_cfg.get("mode", "off")).lower()
         self.v50_cfg = config["model_params"].get("v50_attribution", {})
         self.v50_enabled = bool(self.v50_cfg.get("enabled", False))
         self.v50_event_index = 0
@@ -492,6 +499,13 @@ class BackEnd(mp.Process):
             self.v42a_mode, self.v42a_cfg,
             use_knn=self.use_knn, flow_offset=self.flow_offset,
             dynamic_model=self.dynamic_model, flow_ds=self.flow_ds)
+        validate_v51a_mode(
+            self.v51a_mode, online_mode=self.v42a_mode,
+            flow_ds=self.flow_ds, use_knn=self.use_knn,
+            flow_offset=self.flow_offset, dynamic_model=self.dynamic_model,
+            v43_enabled=self.v43a_enabled, v50_enabled=self.v50_enabled)
+        if self.v51a_mode != "off" and self.v42a_cfg.get("online_trace", False):
+            raise ValueError("V5.1a disables legacy V4.2b online trace, which uses pre-filter indices")
         self.insertion_type = config["model_params"].get("insertion_type", "new")
         self.iters = 200
 
@@ -1876,6 +1890,9 @@ class BackEnd(mp.Process):
         v42b_start = time.perf_counter()
         v42b_ctx = None
         v43a_ctx = None
+        v51a_strict_indices = None
+        v51a_strict_g0 = None
+        v51a_mode_active = self.v51a_mode in ("legacy", "shadow", "strict")
         carnonical_xyz = self.gaussians.get_xyz.clone()[self.gaussians.dygs]
         xyz_at_t1 = carnonical_xyz.detach()  # Detach coordinates of Gaussians here
 
@@ -1886,12 +1903,17 @@ class BackEnd(mp.Process):
         full_proj_transform = closest_viewpoint.full_proj_transform
         gaussians_uvz_coor_at_cam1 = gaussians_homogeneous_coor_t1 @ full_proj_transform
         z = gaussians_uvz_coor_at_cam1[..., -1]
+        # CLIP-w, not camera-space z. Preserve the legacy projection.
+        v51a_source_clip_w = z.detach() if v51a_mode_active else None
         gaussians_uvz_coor_at_cam1 = gaussians_uvz_coor_at_cam1[..., :3] / (gaussians_uvz_coor_at_cam1[..., -1:] + 1e-7)
 
         H, W, _ = flow.shape
         device = flow.device
 
         uvz = gaussians_uvz_coor_at_cam1.to(device)
+        v51a_source_valid = (
+            strict_ndc_valid(uvz,clip_w=v51a_source_clip_w)
+            if v51a_mode_active else None)
         v42a_active = self.v42a_mode != "off" and self.use_knn
         v42a_diag = v42a_gauss_q = None
         v42a1_all_reasons = None
@@ -1961,7 +1983,11 @@ class BackEnd(mp.Process):
         flow_at_uv = torch.gather(flow_flat, 0, idx_2d) # [K,2]
         gaussians_uvz_coor_at_cam2 = gaussians_uvz_coor_at_cam1.clone()
         gaussians_uvz_coor_at_cam2[idx_valid] += torch.cat([flow_at_uv, torch.zeros_like(flow_at_uv[:, :1], device=flow_at_uv.device)], dim=-1)
-
+        # This target image coordinate is the legacy source-projected
+        # NDC plus flow. It is NOT a target-camera reprojection.
+        v51a_target_valid = (
+            strict_ndc_valid(gaussians_uvz_coor_at_cam2)
+            if v51a_mode_active else None)
 
         
         lin_idx2, idx2_valid = self.get_uv_coordinates(gaussians_uvz_coor_at_cam2, H, W)  # [K]
@@ -2017,6 +2043,56 @@ class BackEnd(mp.Process):
                     k=self.knn_n, r_max=self.knn_r, weighting="gaussian",
                     sigma=0.05, include_self=True, eps=1e-8)
                 deformation = g0_v42a
+                if v51a_mode_active:
+                    # Restrict the input to the ORIGINAL G0 smoother to
+                    # prevent rejected out-of-view Gaussians from
+                    # influencing otherwise valid neighbors.
+                    v51a_strict_indices, v51a_keep = v51a_filter_indices(
+                        idx2_valid, v51a_source_valid, v51a_target_valid)
+                    if self.v51a_mode in ("strict","shadow"):
+                        if bool(v51a_keep.any()):
+                            strict_points = points_v42a[v51a_keep]
+                            strict_raw = raw_v42a[v51a_keep]
+                            v51a_strict_g0 = self.smooth_deformation_knn_radius(
+                                points=strict_points, deform=strict_raw,
+                                k=self.knn_n, r_max=self.knn_r,
+                                weighting="gaussian", sigma=0.05,
+                                include_self=True, eps=1e-8)
+                        else:
+                            v51a_strict_g0 = raw_v42a.new_zeros((0,3))
+                    row, keep, strict_idx = compare_v51a_candidates(
+                        frame_id=int(viewpoint.uid),
+                        prior_keyframe_id=int(closest_viewpoint.uid),
+                        mode=self.v51a_mode,
+                        source_valid=v51a_source_valid,
+                        target_valid=v51a_target_valid,
+                        legacy_indices=idx2_valid.detach(),
+                        legacy_raw=raw_v42a.detach(),
+                        legacy_g0=g0_v42a.detach(),
+                        strict_g0=v51a_strict_g0.detach() if
+                            v51a_strict_g0 is not None else None)
+                    details=None
+                    if (bool(self.v51a_cfg.get("save_points",False)) and
+                        int(viewpoint.uid) in self.v51a_cfg.get("detailed_frames",[212,357])):
+                        details={
+                            "legacy_indices":idx2_valid.detach(),
+                            "strict_indices":strict_idx.detach(),
+                            "legacy_raw":raw_v42a.detach(),
+                            "legacy_g0":g0_v42a.detach(),
+                            "strict_g0":v51a_strict_g0.detach() if
+                                v51a_strict_g0 is not None else raw_v42a.new_zeros((0,3)),
+                            "strict_keep":keep.detach(),
+                            "source_valid":v51a_source_valid.detach(),
+                            "target_valid":v51a_target_valid.detach(),
+                        }
+                    append_v51a_comparison(
+                        os.path.join(self.save_dir,"v51a_projection"),row,details)
+                    print("[V5.1a] KF={} mode={} legacy={} strict={} "
+                          "removed_accepted={} shared_delta={:.5f}m".format(
+                            viewpoint.uid,self.v51a_mode,row["n_legacy_candidates"],
+                            row["n_strict_candidates"],
+                            row["n_removed_that_pass_legacy_0p3m_gate"],
+                            row["shared_strict_vs_legacy_g0_mean_m"]))
                 if v42a_active and raw_v42a.shape[0] > 0:
                     with torch.no_grad():
                         q_points = v42a_gauss_q[idx2_valid].detach()
@@ -2280,6 +2356,11 @@ class BackEnd(mp.Process):
                         viewpoint.uid,by_h["g0"]["dynamic_rgb_mae"],
                         by_h["g3_support"]["dynamic_rgb_mae"],
                         by_h["g4"]["dynamic_rgb_mae"]))
+            if self.v51a_mode == "strict" and v51a_strict_indices is not None:
+                # Values absent from strict candidate indices inherit their
+                # previous offset. Do not globally alter projection/RAFT.
+                idx2_valid = v51a_strict_indices
+                deformation = v51a_strict_g0
             v42b_before_update = time.perf_counter()
             self.gaussians.update_delta_xyz(viewpoint.uid, closest_viewpoint.uid, deformation, idx2_valid,
                                             max_motion=0.3)
