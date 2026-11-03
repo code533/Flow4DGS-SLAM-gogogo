@@ -38,6 +38,8 @@ from utils.v43a2_temporal import (
 from utils.v43a4_predictive import (
     is_systematic_source, validate_protocol, score_from_maps,
     audit_source_future, save_policy_results)
+from utils.v50_motion_attribution import (
+    eligible_event as v50_eligible_event, summarize_v50, append_v50)
 
 def print_lrs(optimizer, step, every=50):
     if step % every != 0:
@@ -431,6 +433,17 @@ class BackEnd(mp.Process):
         self.knn_r = config["model_params"].get("knn_r", 0.2)
         self.v42a_cfg = config["model_params"].get("v42a_propagation", {})
         self.v42a_mode = str(self.v42a_cfg.get("mode", "off")).lower()
+        self.v50_cfg = config["model_params"].get("v50_attribution", {})
+        self.v50_enabled = bool(self.v50_cfg.get("enabled", False))
+        self.v50_event_index = 0
+        self.v50_every = int(self.v50_cfg.get("every_n_event", 1))
+        if self.v50_enabled:
+            if self.v50_every < 1:
+                raise ValueError("V5.0 every_n_event must be >= 1")
+            if self.v42a_mode != "g0":
+                raise ValueError("V5.0 requires instrumented G0 propagation")
+            if not (self.use_knn and self.flow_offset and self.dynamic_model == "offset"):
+                raise ValueError("V5.0 requires KNN, flow_offset and offset dynamics")
         self.v43a_cfg = config["model_params"].get("v43a_observation", {})
         self.v43a_enabled = bool(self.v43a_cfg.get("enabled", False))
         self.v43a_eligible_events = 0
@@ -1889,7 +1902,8 @@ class BackEnd(mp.Process):
         v42a2_enabled = v42a_active and (v42a2_log or v42b_online)
         v42a1_log = v42a_active and (
             bool(self.v42a_cfg.get("attribute_failures", False)) or v42a2_log)
-        v42a1_enabled = v42a_active and (v42a1_log or v42a2_enabled)
+        v42a1_enabled = v42a_active and (
+            v42a1_log or v42a2_enabled or self.v50_enabled)
         if v42a2_log and self.v42a_mode != "shadow":
             raise ValueError("V4.2a Shadow diagnostics cannot be used during online modes")
         if v42a_active:
@@ -1915,6 +1929,9 @@ class BackEnd(mp.Process):
         # Gather
         flow_flat = flow.reshape(-1, 2)          # [H*W, 2]
         lin_idx, idx_valid = self.get_uv_coordinates(uvz, H, W)  # [K]
+        v50_stage_counts = {}
+        if self.v50_enabled:
+            v50_stage_counts["source_projected"] = int(idx_valid.numel())
 
 
         enlarged_closest_motion_mask, fillin_closest_mask = self.enlarge_false(closest_viewpoint.motion_mask, pixels=5, outside_is_false=True)
@@ -1934,6 +1951,8 @@ class BackEnd(mp.Process):
             depth_mask = (diff < 0.3).squeeze(-1)  # [K]
             idx_valid = idx_valid[depth_mask]
             lin_idx = lin_idx[depth_mask]
+        if self.v50_enabled:
+            v50_stage_counts["source_depth_consistent"] = int(idx_valid.numel())
         
         lin_idx = lin_idx.view(-1)
         idx_2d = lin_idx.unsqueeze(1).expand(-1, 2)  # [K,2]
@@ -1948,6 +1967,8 @@ class BackEnd(mp.Process):
         lin_idx2, idx2_valid = self.get_uv_coordinates(gaussians_uvz_coor_at_cam2, H, W)  # [K]
         lin_idx2 = lin_idx2[idx_valid].view(-1)
         idx2_valid = idx2_valid[idx_valid]
+        if self.v50_enabled:
+            v50_stage_counts["target_projection_valid"] = int(idx2_valid.numel())
 
 
         depth_map = viewpoint.depth.copy()
@@ -1969,6 +1990,11 @@ class BackEnd(mp.Process):
                                                
         sampled = torch.gather(valid_mask, 0, lin_idx2)
         sampled_valid_idx = torch.nonzero(sampled, as_tuple=False).squeeze(1)
+        if self.v50_enabled:
+            v50_stage_counts["target_filled_depth_valid"] = int(sampled_valid_idx.numel())
+            # Original raw depth is used ONLY for evidence classification;
+            # Mapping's filled depth and motion calculation remain unchanged.
+            v50_target_linear = lin_idx2[sampled_valid_idx].long()
         idx2_valid = idx2_valid[sampled_valid_idx]
         deformed_gaussians_xyz = deformed_gaussians_xyz[lin_idx2][sampled_valid_idx]
 
@@ -1978,6 +2004,9 @@ class BackEnd(mp.Process):
         if max_motion_mask.shape[0] > 0:
             idx2_valid = idx2_valid[max_motion_mask]
             deformation = deformation[max_motion_mask]
+            if self.v50_enabled:
+                v50_target_linear = v50_target_linear[max_motion_mask]
+                v50_stage_counts["raw_motion_under_1m"] = int(idx2_valid.numel())
 
 
             if self.use_knn:
@@ -1991,6 +2020,36 @@ class BackEnd(mp.Process):
                 if v42a_active and raw_v42a.shape[0] > 0:
                     with torch.no_grad():
                         q_points = v42a_gauss_q[idx2_valid].detach()
+                        if self.v50_enabled:
+                            self.v50_event_index += 1
+                            event_num = self.v50_event_index
+                            if v50_eligible_event(event_num,self.v50_every):
+                                original_depth = torch.as_tensor(
+                                    viewpoint.depth,device=device,dtype=flow.dtype).reshape(-1)
+                                raw_target_depth = original_depth[v50_target_linear]
+                                original_valid = torch.isfinite(raw_target_depth) & (raw_target_depth > .01)
+                                frame_row,group_rows,detail = summarize_v50(
+                                    frame_id=int(viewpoint.uid),
+                                    prior_keyframe_id=int(closest_viewpoint.uid),
+                                    event_index=event_num,
+                                    all_reasons=v42a1_all_reasons["reason"],
+                                    selected_indices=idx2_valid.detach(),
+                                    selected_target_observed=original_valid.detach(),
+                                    raw_disp=raw_v42a.detach(),
+                                    g0_disp=g0_v42a.detach(),
+                                    selected_q=q_points,
+                                    stage_counts=v50_stage_counts,
+                                    q_threshold=float(self.v50_cfg.get("q_threshold",.3)),
+                                    update_gate_m=.3)
+                                save_detail=bool(self.v50_cfg.get("save_points",False)) and (
+                                    int(viewpoint.uid) in self.v50_cfg.get("detailed_frames",[212,357]))
+                                append_v50(os.path.join(self.save_dir,"v50_attribution"),
+                                           frame_row,group_rows,detail if save_detail else None)
+                                print("[V5.0] KF={} observed={} selected={} gate={:.3f}".format(
+                                    viewpoint.uid,
+                                    frame_row["selected_original_target_depth_valid_fraction"],
+                                    frame_row["n_selected_movements"],
+                                    frame_row["g0_update_gate_pass_fraction"]))
                         graph = knn_points(points_v42a[None], points_v42a[None],
                                            K=min(int(self.knn_n), len(points_v42a)),
                                            return_nn=False)
