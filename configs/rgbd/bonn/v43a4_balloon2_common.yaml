@@ -1,0 +1,70 @@
+# V4.3a.4 Balloon2 common preset.
+# Inherits the cleaned Flow4DGS config plus the original balloon2 overrides.
+# IMPORTANT: use `--config <smoke|full>.yaml` only, NO --inherit_from.
+inherit_from: "configs/rgbd/bonn/config.yaml"
+
+Dataset:
+  dataset_path: "datasets/bonn/rgbd_bonn_balloon2"
+  bound: [[-8.0,-8.5,-7.0],[8.5,8.5,8.0]]
+  Calibration:
+    fx: 542.822841
+    fy: 542.576870
+    cx: 315.593520
+    cy: 237.756098
+    k1: 0.039903
+    k2: -0.099343
+    p1: -0.00073
+    p2: -0.000144
+    k3: 0.0
+    distorted: true
+    width: 640
+    height: 480
+    depth_scale: 5000.0
+
+Training:
+  single_thread: true
+  dystart: 43
+  mask_loss: 0
+  flow_ds: 1
+
+model_params:
+  # Instrumented G0: candidate rendering is read-only.
+  # Never use G3/G4 online during V4.3a.4.
+  v42a_propagation:
+    mode: 'g0'
+    g34_shadow: false
+    g4_ablation: false
+    attribute_failures: false
+    save_points: false
+    g34_save_points: false
+    g4_ablation_save_points: false
+    g4_motion_sigma_m: 0.08
+    g4_trusted_q: 0.30
+    g4_min_neighbors: 3
+    g4_min_support: 0.25
+    g4_max_dispersion_m: 0.12
+    g4_max_delta_from_g0_m: null
+
+  v43a_observation:
+    enabled: true
+    every_n_keyframe: 1
+    detailed_frames: [9999]
+    save_maps: false
+    region_analysis: false
+    opacity_threshold: 0.1
+    uncovered_penalty_m: 0.5
+    temporal_enabled: true
+    temporal_source_frames: [9999]
+    temporal_max_frame_gap: 12
+
+    predictive_enabled: true
+    predictive_min_dynamic_depth_pixels: 256
+    predictive_min_interior_depth_pixels: 64
+    predictive_interior_erosion_px: 5
+    predictive_clip_m: 0.05
+    predictive_huber_delta_m: 0.02
+    predictive_decision_margin_m: 0.0002
+    predictive_future_tie_tol_m: 0.0001
+    predictive_coverage_tolerance: 0.005
+    predictive_min_coverage_fraction: 0.95
+    predictive_save_future_maps: false
