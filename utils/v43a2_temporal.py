@@ -81,7 +81,8 @@ def evaluate_frozen_future(pending, future_viewpoint, *,
                            max_frame_gap=12, opacity_threshold=.1,
                            uncovered_penalty_m=.5,
                            rgb_tolerance=1e-5,
-                           depth_tolerance_m=1e-4):
+                           depth_tolerance_m=1e-4,
+                           return_maps=False):
     """Evaluate exactly the next keyframe or reject it with explicit reason.
 
     Uses same snapshot, same accepted 0.3m gated offsets and GMM query time
@@ -95,7 +96,7 @@ def evaluate_frozen_future(pending, future_viewpoint, *,
         raise ValueError("Future UID must strictly follow source")
     if gap > max_frame_gap:
         raise ValueError("Temporal holdout gap {} exceeds {}".format(gap,max_frame_gap))
-    scored,_ = evaluate_hypotheses(
+    scored,render_maps = evaluate_hypotheses(
         frame_id=future,pc=pending["model"],viewpoint=future_viewpoint,
         prior_keyframe_id=pending["prior_uid"],
         prev_delta=pending["prev_delta"],
@@ -104,7 +105,7 @@ def evaluate_frozen_future(pending, future_viewpoint, *,
         render_fn=render_fn,pipeline=pipeline,background=background,
         opacity_threshold=opacity_threshold,
         uncovered_penalty_m=uncovered_penalty_m,
-        save_maps=False)
+        save_maps=return_maps)
     prior=pending["source_rows"]
     future_dict={r["hypothesis"]:r for r in scored}
     rows=[]
@@ -156,7 +157,7 @@ def evaluate_frozen_future(pending, future_viewpoint, *,
                 (future_rgb_delta < -rgb_tolerance) and
                 (future_depth_delta < -depth_tolerance_m)),
         ))
-    return rows
+    return (rows,render_maps) if return_maps else rows
 
 
 def append_future_rows(folder, rows):
