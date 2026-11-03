@@ -1,0 +1,368 @@
+Dataset:
+  Calibration:
+    cx: 315.59352
+    cy: 237.756098
+    depth_scale: 5000.0
+    distorted: true
+    fx: 542.822841
+    fy: 542.57687
+    height: 480
+    k1: 0.039903
+    k2: -0.099343
+    k3: 0.0
+    p1: -0.00073
+    p2: -0.000144
+    width: 640
+  adaptive_pointsize: true
+  bound:
+  - - -8.0
+    - -8.5
+    - -7.0
+  - - 8.5
+    - 8.5
+    - 8.0
+  dataset_path: datasets/bonn/rgbd_bonn_balloon
+  eval_rendering: false
+  pcd_downsample: 128
+  pcd_downsample_init: 32
+  point_size: 0.01
+  sensor_type: depth
+  type: tum
+Results:
+  eval_rendering: true
+  save_dir: results
+  save_results: false
+  save_trj: true
+  save_trj_kf_intv: 5
+  use_gui: false
+  use_wandb: false
+Training:
+  alpha: 0.9
+  dystart: 32
+  edge_threshold: 1.1
+  flow_loss: 3.0
+  gaussian_extent: 1.0
+  gaussian_reset: 2001
+  gaussian_th: 0.7
+  gaussian_update_every: 150
+  gaussian_update_offset: 50
+  init_gaussian_extent: 30
+  init_gaussian_reset: 500
+  init_gaussian_th: 0.005
+  init_gaussian_update: 100
+  init_itr_num: 1050
+  kf_cutoff: 0.3
+  kf_interval: 5
+  kf_min_translation: 0.05
+  kf_overlap: 0.9
+  kf_translation: 0.08
+  lr:
+    cam_rot_delta: 0.003
+    cam_trans_delta: 0.001
+  mapping_itr_num: 50
+  mask_loss: 0.01
+  offset_loss: 1.0
+  pose_window: 3
+  prune_mode: slam
+  rgb_boundary_threshold: 0.01
+  single_thread: true
+  size_threshold: 20
+  spherical_harmonics: false
+  tracking_itr_num: 200
+  window_size: 8
+model_params:
+  # V4.0 observation-only, OFF by default. Logs static-only pre/post residuals.
+  v40_diagnostics:
+    enabled: false
+    every: 10
+    opacity_min: 0.95
+    save_maps: true
+  # V4.0a full-flow + static-map observations; no effect on SLAM optimization.
+  v40a_diagnostics:
+    enabled: false
+    every: 10
+    opacity_min: 0.95
+    save_maps: true
+    forward_backward: true
+  # V4.0b: independent reliability calibration; V4.0/V4.0a OFF.
+  v40b_calibration:
+    enabled: false
+    every: 10
+    opacity_min: 0.95
+    save_maps: true
+    forward_backward: true
+    depth_edge_abs_m: 0.08
+    depth_edge_rel: 0.06
+    depth_edge_dilate: 2
+    fb_bad_px: 1.0
+    high_motion_px: 5.0
+    low_fb_px: 0.5
+  data_device: cuda
+  depth_check: true
+  dynamic_model: offset
+  flow_cam: true
+  # CIMD-V3.0 camera-motion diagnostics / optional translation cap.
+  # V1/V2/V2.1/V2.2 should all be disabled for controlled experiments.
+  flow_cam_v30:
+    enabled: false              # enable for V3.0 experiments
+    translation_mode: legacy    # legacy | capped (only changes translation)
+    save_debug: false
+    debug_every: 10
+    condition_stride: 8
+    save_residual_maps: false
+  # CIMD-V3.1 geometry-aware IRLS (disabled by default).
+  # Disable V1-V2.2 and test V3.0 legacy clipping separately.
+  flow_cam_v31:
+    enabled: false
+    stage: refit_only         # first_only | refit_only | both
+    sampling_stride: 4
+    grid_rows: 6
+    grid_cols: 8
+    grid_balance: 0.50
+    iterations: 12
+    min_points: 600
+    min_cells: 12
+    min_depth: 0.10
+    max_depth: 15.0
+    depth_edge_relative: 0.06
+    depth_edge_weight: 0.35
+    flow_edge_px: 3.0
+    flow_edge_weight: 0.60
+    robust_scale_floor_px: 0.25
+    max_condition: 1.0e7
+    save_debug: false
+    debug_every: 30
+  # V3.1a paired Shadow Mode: never changes Tracking pose.
+  # Requires V3.0, V3.1 and all earlier Tracking experiments disabled.
+  flow_cam_v31a:
+    enabled: false
+    save_debug: false
+    debug_every: 1
+    sampling_stride: 4
+    grid_rows: 6
+    grid_cols: 8
+    grid_balance: 0.50
+    iterations: 12
+    min_points: 600
+    min_cells: 12
+    min_depth: 0.10
+    max_depth: 15.0
+    depth_edge_relative: 0.06
+    depth_edge_weight: 0.35
+    flow_edge_px: 3.0
+    flow_edge_weight: 0.60
+    robust_scale_floor_px: 0.25
+    max_condition: 1.0e7
+  flow_mask: true
+  rgbd_uncertainty:
+    enabled: false       # baseline off; turn on for V1 experiment
+    warmup_iters: 3
+    opacity_min: 0.95
+    min_depth: 0.01
+    max_depth: 1000.0
+    rgb_coeff: 0.40
+    depth_coeff: 0.60
+    rgb_scale: 0.10
+    depth_rel_scale: 0.10
+    threshold: 1.60
+    temperature: 0.35
+    min_weight: 0.10
+    min_coverage: 0.08
+    binary_threshold: 0.80 # diagnostics only
+    smoothing_kernel: 3
+    save_debug: false
+    debug_every: 30
+  # Optional V2: conservative flow + static RGB-D residual fusion for Tracking.
+  # Keep V1 (rgbd_uncertainty.enabled) disabled when using this.
+  flow_rgbd_v2:
+    enabled: false
+    warmup_iters: 6
+    refresh_interval: 8
+    opacity_min: 0.95
+    min_depth: 0.01
+    max_depth: 1000.0
+    min_coverage: 0.25
+    reject_depth_edges: true
+    edge_threshold: 0.08
+    flow_scale_floor_px: 0.30
+    flow_z_threshold: 2.0
+    flow_temperature: 0.50
+    front_min_rel: 0.035
+    front_temperature: 0.015
+    rgb_min_error: 0.08
+    rgb_temperature: 0.035
+    candidate_threshold: 0.55
+    min_weight: 0.70
+    max_downweight_fraction: 0.12
+    save_debug: false
+    debug_every: 30
+  # V2.1: interpretable two-branch flow/RGB-D fusion. OFF by default.
+  # V1 and V2 must also be disabled when V2.1 is enabled.
+  flow_rgbd_v21:
+    enabled: false
+    fusion_mode: layered        # layered | product (V2-style ablation)
+    diagnostic_only: false     # true: record maps without changing Tracking
+    warmup_iters: 6
+    refresh_interval: 8
+    opacity_min: 0.95
+    min_depth: 0.01
+    max_depth: 1000.0
+    min_coverage: 0.25
+    reject_depth_edges: true
+    edge_threshold: 0.08
+    flow_scale_floor_px: 0.30
+    flow_z_threshold: 2.0
+    flow_temperature: 0.50
+    front_min_rel: 0.035
+    front_temperature: 0.015
+    rgb_min_error: 0.08
+    rgb_temperature: 0.035
+    rgb_share: 0.55
+    flow_share: 0.55
+    flow_prior_min: 0.35
+    map_prior_min: 0.35
+    layered_threshold: 0.55
+    product_threshold: 0.55
+    min_candidate_pixels: 32
+    min_weight: 0.80
+    max_downweight_fraction: 0.05
+    save_debug: true
+    debug_every: 30
+  # V2.2: split RGB/Depth residual reliability for tracking. OFF by default.
+  # V1/V2/V2.1 and V2.2 are mutually exclusive.
+  flow_rgbd_v22:
+    enabled: false
+    mode: decoupled            # decoupled | rgb_only | depth_only | all_ones
+    diagnostic_only: false
+    normalization: mass_preserving   # mass_preserving | original_mean
+    warmup_iters: 6
+    refresh_interval: 8
+    opacity_min: 0.95
+    min_depth: 0.01
+    max_depth: 1000.0
+    min_coverage: 0.25
+    reject_depth_edges: true
+    edge_threshold: 0.08
+    flow_scale_floor_px: 0.30
+    flow_z_threshold: 2.0
+    flow_temperature: 0.50
+    front_min_rel: 0.035
+    front_temperature: 0.015
+    rgb_min_error: 0.08
+    rgb_temperature: 0.035
+    flow_prior_min: 0.35
+    rgb_prior_min: 0.55
+    depth_prior_min: 0.65
+    rgb_min_weight: 0.95
+    depth_min_weight: 0.80
+    rgb_max_fraction: 0.015
+    depth_max_fraction: 0.03
+    rgb_min_candidate_pixels: 32
+    depth_min_candidate_pixels: 32
+    save_debug: false
+    debug_every: 30
+  flow_offset: true
+  insertion: true
+  model_path: ''
+  resolution: -1
+  sd: true
+  sh_degree: 0
+  source_path: ''
+  use_gmm: true
+  use_gmm_rot: true
+  # V4.2a mapping ablation, disabled by default.
+  v42a_propagation:
+    mode: 'off'   # off / shadow / g0 / g1 / g2 / g3 / g3_support / g4
+    fb_scale_px: 1.0
+    edge_abs_m: 0.08
+    edge_rel: 0.06
+    edge_penalty: 0.65
+    min_support: 0.45
+    min_neighbors: 3
+    neighbor_q_min: 0.3
+    save_points: false
+    # V4.2a.1 read-only attribution: enable only with mode: shadow.
+    attribute_failures: false
+    save_attribution_points: false
+    detailed_frames: [22, 212, 357, 382]
+    motion_mismatch_m: 0.10
+    # V4.2a.2: strict shadow-only proposals (actual map still uses G0).
+    g34_shadow: false
+    g34_save_points: true
+    g34_detailed_frames: [22, 212, 357, 382]
+    g4_motion_sigma_m: 0.08
+    g4_trusted_q: 0.30
+    g4_min_neighbors: 3
+    g4_min_support: 0.25
+    g4_max_dispersion_m: 0.12
+    g4_max_delta_from_g0_m: null
+    # V4.2a.3 paired mechanism ablation, SHADOW ONLY.
+    g4_ablation: false
+    g4_ablation_save_points: true
+    g4_ablation_frames: [22, 212, 357, 382]
+    # V4.2b online modes (G0 instrumented; original legacy mode is 'off').
+    online_trace: false
+  # V4.3a: read-only paired render BEFORE online G0 update
+  v43a_observation:
+    enabled: false
+    # Evaluate each eligible propagation event when 1; every 5th when 5.
+    every_n_keyframe: 1
+    detailed_frames: [212, 357]
+    save_maps: false
+    opacity_threshold: 0.1
+    uncovered_penalty_m: 0.5
+    region_analysis: false
+    grid_rows: 6
+    grid_cols: 8
+    min_dynamic_rgb_pixels: 64
+    min_dynamic_depth_pixels: 16
+    rgb_tolerance: 0.00001
+    depth_tolerance_m: 0.0001
+    # V4.3a.2: optional frozen-map next-keyframe persistence check
+    temporal_enabled: false
+    temporal_source_frames: [207, 237, 247, 252, 317, 357, 412]
+    temporal_max_frame_gap: 12
+    # V4.3a.4 preregistered source -> next-keyframe robust predictor
+    predictive_enabled: false
+    predictive_source_every_n_event: 10
+    predictive_max_sources: 25
+    predictive_min_dynamic_depth_pixels: 256
+    predictive_min_interior_depth_pixels: 64
+    predictive_interior_erosion_px: 5
+    predictive_clip_m: 0.05
+    predictive_huber_delta_m: 0.02
+    predictive_decision_margin_m: 0.0002
+    predictive_future_tie_tol_m: 0.0001
+    predictive_coverage_tolerance: 0.005
+    predictive_min_coverage_fraction: 0.95
+    predictive_save_future_maps: false
+  use_knn: true
+  white_background: false
+opt_params:
+  deformation_lr_delay_mult: 0.01
+  deformation_lr_final: 1.6e-05
+  deformation_lr_init: 0.00016
+  densification_interval: 100
+  densify_from_iter: 500
+  densify_grad_threshold: 0.0002
+  densify_until_iter: 15000
+  feature_lr: 0.0025
+  grid_lr_final: 0.00016
+  grid_lr_init: 0.0016
+  iterations: 30000
+  lambda_dssim: 0.2
+  opacity_lr: 0.05
+  opacity_reset_interval: 3000
+  percent_dense: 0.01
+  position_lr_delay_mult: 0.01
+  position_lr_final: 1.6e-06
+  position_lr_init: 0.00016
+  position_lr_max_steps: 30000
+  rotation_lr: 0.001
+  scaling_lr: 0.001
+  trbfc_lr: 0.0001
+  trbfs_lr: 0.04
+pipeline_params:
+  compute_cov3D_python: false
+  convert_SHs_python: false
+yolo: true
