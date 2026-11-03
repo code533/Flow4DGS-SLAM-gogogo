@@ -118,7 +118,10 @@ python slam.py --inherit_from configs/rgbd/bonn/config.yaml \
 ```
 
 First smoke test with `predictive_max_sources: 2` and
-`predictive_source_every_n_event: 5`. The code may retain a full copy
+`predictive_source_every_n_event: 5`. For the broader balloon2 run,
+set `predictive_source_every_n_event: 4` and
+`predictive_max_sources: 25` (roughly 24 systematic source events
+if 95 eligible keyframes arise again). The code may retain a full copy
 of GaussianModel on GPU until the next keyframe; memory and rendering
 overhead can alter asynchronous SLAM scheduling. Do not interpret ATE
 differences from this diagnostic run as an improvement.
