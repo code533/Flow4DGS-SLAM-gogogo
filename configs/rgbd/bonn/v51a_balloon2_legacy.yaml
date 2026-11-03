@@ -1,0 +1,5 @@
+# V5.1a legacy instrumented G0, identical update semantics.
+inherit_from: "configs/rgbd/bonn/v51a_balloon2_common.yaml"
+model_params:
+  v51a_projection:
+    mode: 'legacy'
