@@ -1,0 +1,13 @@
+# V5.1b strict: same V5.1a online mode, reuse final rendering to score RGB-D.
+inherit_from: "configs/rgbd/bonn/v51a_balloon2_strict.yaml"
+
+model_params:
+  v51b_dynamic_eval:
+    enabled: true
+    mode: 'strict'
+    phases: ['before_opt']
+    every_n_frame: 1
+    detailed_frames: [212, 357, 342, 352, 362, 372, 382]
+    opacity_threshold: 0.1
+    uncovered_penalty_m: 0.5
+    boundary_width_px: 5
