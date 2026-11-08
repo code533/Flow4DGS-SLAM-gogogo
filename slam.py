@@ -250,6 +250,8 @@ class SLAM:
                         iteration="before_opt",
                         save_interval=save_interval,
                         interp_type=self.interp_type,
+                        dynamic_eval_cfg=self.config["model_params"].get(
+                            "v51b_dynamic_eval", {}),
                     )
                     columns = ["tag", "psnr", "ssim", "lpips", "RMSE ATE", "FPS"]
                     metrics_table = wandb.Table(columns=columns)
@@ -299,6 +301,8 @@ class SLAM:
                         iteration="after_opt",
                         save_interval=save_interval,
                         interp_type=self.interp_type,
+                        dynamic_eval_cfg=self.config["model_params"].get(
+                            "v51b_dynamic_eval", {}),
                     )
                     metrics_table.add_data(
                         "After",
