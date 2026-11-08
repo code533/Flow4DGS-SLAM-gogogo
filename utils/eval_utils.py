@@ -25,6 +25,8 @@ from gaussian_splatting.utils.image_utils import psnr
 from gaussian_splatting.utils.loss_utils import ssim
 from gaussian_splatting.utils.system_utils import mkdir_p
 from utils.logging_utils import Log
+from utils.v51b_dynamic_metrics import (
+    measure_dynamic_reconstruction, write_frame_metrics)
 
 
 def vis_render_process(render_pkg, gt_color, gt_depth, cur_frame_idx, save_dir, out_dir="fin_render"):
@@ -398,12 +400,21 @@ def eval_rendering(
     iteration="final",
     save_interval=None,
     interp_type='linear',
+    dynamic_eval_cfg=None,
 ):
     interval = 5
     img_pred, img_gt, saved_frame_idx = [], [], []
     end_idx = len(frames) - 1 if iteration == "final" or "before_opt" else iteration
     psnr_array, ssim_array, lpips_array = [], [], []
     depth_array = []
+    dynamic_eval_cfg = dynamic_eval_cfg or {}
+    dynamic_eval_on = (
+        bool(dynamic_eval_cfg.get("enabled",False))
+        and str(iteration) in dynamic_eval_cfg.get("phases",["before_opt"]))
+    dynamic_eval_rows = []
+    dynamic_every = int(dynamic_eval_cfg.get("every_n_frame",1))
+    if dynamic_eval_on and dynamic_every < 1:
+        raise ValueError("V5.1b every_n_frame must be >= 1")
     cal_lpips = LearnedPerceptualImagePatchSimilarity(
         net_type="alex", normalize=True
     ).to("cuda")
@@ -487,6 +498,20 @@ def eval_rendering(
         )
 
 
+        if dynamic_eval_on and (idx % dynamic_every == 0 or idx in dynamic_eval_cfg.get("detailed_frames",[])):
+            # Reuse this very same final-evaluation render. The dataset
+            # mask is TRUE for static background. Keep all observed depth
+            # pixels as a fixed scoring denominator across methods.
+            dynamic_eval_rows.append(measure_dynamic_reconstruction(
+                frame_idx=idx,frame_uid=int(frame.uid),phase=str(iteration),
+                mode=str(dynamic_eval_cfg.get("mode","unknown")),
+                is_keyframe=(int(frame.uid) in kf_indices),
+                render_rgb=render_pkg["render"],render_depth=render_pkg["depth"],
+                render_opacity=render_pkg["opacity"],gt_rgb=gt_image,
+                gt_depth=gt_depth,static_mask=motion_mask,
+                opacity_threshold=float(dynamic_eval_cfg.get("opacity_threshold",.1)),
+                uncovered_penalty_m=float(dynamic_eval_cfg.get("uncovered_penalty_m",.5)),
+                boundary_width_px=int(dynamic_eval_cfg.get("boundary_width_px",5))))
         if iteration == "before_opt":
             if (idx + 1) % save_interval == 0 or idx == 0:
                 vis_render_process(render_pkg, gt_image, gt_depth, idx, save_dir, out_dir="before_opt")
@@ -543,6 +568,14 @@ def eval_rendering(
 
             np.save(os.path.join(save_dir, "opacity_list.npy"), opacity_list)
 
+    if dynamic_eval_on:
+        folder=os.path.join(save_dir,"v51b_dynamic_eval")
+        if dynamic_eval_rows:
+            path=write_frame_metrics(folder,str(iteration),dynamic_eval_rows)
+            print("[V5.1b] {}: {} scored frames, CSV={}".format(
+                  iteration,len(dynamic_eval_rows),path))
+        else:
+            print("[V5.1b] {}: no scored frames (dataset too short)".format(iteration))
     output = dict()
     output["mean_psnr"] = float(np.mean(psnr_array))
     output["mean_ssim"] = float(np.mean(ssim_array))
