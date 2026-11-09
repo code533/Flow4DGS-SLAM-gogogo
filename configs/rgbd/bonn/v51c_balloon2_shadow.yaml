@@ -1,0 +1,13 @@
+# V5.1c: SHADOW baseline on Balloon2; no online Strict update.
+# All three local renders use the same pre-Mapping map and camera.
+inherit_from: "configs/rgbd/bonn/v51a_balloon2_shadow.yaml"
+
+model_params:
+  v51c_controlled:
+    enabled: true
+    every_n_event: 10
+    max_sources: 12
+    opacity_threshold: 0.1
+    uncovered_penalty_m: 0.5
+    boundary_width_px: 5
+    history_min_m: 0.005
