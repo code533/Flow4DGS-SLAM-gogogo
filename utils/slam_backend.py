@@ -45,6 +45,10 @@ from utils.v51a_strict_projection import (
     strict_indices as v51a_filter_indices,
     compare_candidates as compare_v51a_candidates,
     append_comparison as append_v51a_comparison)
+from utils.v51c_controlled_attribution import (
+    should_capture as v51c_should_capture,
+    evaluate_controlled as v51c_evaluate_controlled,
+    append_rows as v51c_append_rows)
 
 def print_lrs(optimizer, step, every=50):
     if step % every != 0:
@@ -440,6 +444,12 @@ class BackEnd(mp.Process):
         self.v42a_mode = str(self.v42a_cfg.get("mode", "off")).lower()
         self.v51a_cfg = config["model_params"].get("v51a_projection", {})
         self.v51a_mode = str(self.v51a_cfg.get("mode", "off")).lower()
+        self.v51c_cfg = config["model_params"].get("v51c_controlled", {})
+        self.v51c_enabled = bool(self.v51c_cfg.get("enabled", False))
+        self.v51c_event_index = 0
+        self.v51c_captured = 0
+        self.v51c_every = int(self.v51c_cfg.get("every_n_event", 10))
+        self.v51c_limit = int(self.v51c_cfg.get("max_sources", 12))
         self.v50_cfg = config["model_params"].get("v50_attribution", {})
         self.v50_enabled = bool(self.v50_cfg.get("enabled", False))
         self.v50_event_index = 0
@@ -504,6 +514,13 @@ class BackEnd(mp.Process):
             flow_ds=self.flow_ds, use_knn=self.use_knn,
             flow_offset=self.flow_offset, dynamic_model=self.dynamic_model,
             v43_enabled=self.v43a_enabled, v50_enabled=self.v50_enabled)
+        if self.v51c_enabled:
+            if self.v51a_mode != "shadow":
+                raise ValueError("V5.1c fixed-map study needs V5.1a shadow to keep online G0")
+            if self.v51c_every < 1 or self.v51c_limit < 1:
+                raise ValueError("V5.1c interval and source limit must be positive")
+            if self.v43a_enabled or self.v50_enabled:
+                raise ValueError("Disable V4.3 and V5.0 diagnostics during V5.1c")
         if self.v51a_mode != "off" and self.v42a_cfg.get("online_trace", False):
             raise ValueError("V5.1a disables legacy V4.2b online trace, which uses pre-filter indices")
         self.insertion_type = config["model_params"].get("insertion_type", "new")
@@ -2087,6 +2104,32 @@ class BackEnd(mp.Process):
                         }
                     append_v51a_comparison(
                         os.path.join(self.save_dir,"v51a_projection"),row,details)
+                    if self.v51c_enabled:
+                        self.v51c_event_index += 1
+                        if v51c_should_capture(self.v51c_event_index,
+                                               self.v51c_every,self.v51c_limit,
+                                               self.v51c_captured):
+                            # One map/camera/observation, pre-Mapping and pre-update.
+                            # Shadow online propagation remains unchanged G0.
+                            paired = v51c_evaluate_controlled(
+                                model=self.gaussians,viewpoint=viewpoint,
+                                prior_uid=int(closest_viewpoint.uid),
+                                frame_id=int(viewpoint.uid),
+                                event_index=self.v51c_event_index,
+                                legacy_indices=idx2_valid.detach(),
+                                legacy_g0=g0_v42a.detach(),
+                                strict_indices=strict_idx.detach(),
+                                strict_g0=v51a_strict_g0.detach(),
+                                render_fn=render,pipeline=self.pipeline_params,
+                                background=self.background,
+                                opacity_threshold=float(self.v51c_cfg.get("opacity_threshold",.1)),
+                                uncovered_penalty_m=float(self.v51c_cfg.get("uncovered_penalty_m",.5)),
+                                boundary_width_px=int(self.v51c_cfg.get("boundary_width_px",5)),
+                                history_min_m=float(self.v51c_cfg.get("history_min_m",.005)))
+                            v51c_append_rows(os.path.join(self.save_dir,"v51c_controlled"),paired)
+                            self.v51c_captured += 1
+                            print("[V5.1c] KF={} fixed-map hold/legacy/strict evaluated ({}/{})".format(
+                                  viewpoint.uid,self.v51c_captured,self.v51c_limit))
                     print("[V5.1a] KF={} mode={} legacy={} strict={} "
                           "removed_accepted={} shared_delta={:.5f}m".format(
                             viewpoint.uid,self.v51a_mode,row["n_legacy_candidates"],
