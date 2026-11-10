@@ -1,0 +1,11 @@
+# V5.2a shadow: one complete Hold/Legacy/Strict/Strict+History frozen source.
+inherit_from: "configs/rgbd/bonn/v51d_balloon2_smoke.yaml"
+model_params:
+  v52a_history:
+    enabled: true
+    min_step_m: 0.005
+    max_speed_m_per_frame: 0.04
+    min_direction_cos: 0.5
+    max_speed_ratio: 2.0
+    max_predicted_increment_m: 0.10
+    history_frame_gap_cap: 20
