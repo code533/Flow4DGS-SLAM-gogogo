@@ -1,0 +1,5 @@
+# V5.1d full: same controlled setup, up to 12 non-overlapping snapshots.
+inherit_from: "configs/rgbd/bonn/v51d_balloon2_smoke.yaml"
+model_params:
+  v51d_temporal:
+    max_sources: 12
