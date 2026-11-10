@@ -176,6 +176,12 @@ def _append_csv(filename, rows):
         writer.writerows(rows)
 
 
+def append_source_rows(folder, rows):
+    if len(rows)!=len(CHOICES) or [r["mode"] for r in rows]!=list(CHOICES):
+        raise ValueError("Incomplete hold/legacy/strict source comparison")
+    _append_csv(Path(folder)/"v51d_source_per_keyframe.csv",rows)
+
+
 def append_future_rows(folder, rows):
     if len(rows)!=len(CHOICES) or [r["mode"] for r in rows]!=list(CHOICES):
         raise ValueError("Incomplete hold/legacy/strict future comparison")
