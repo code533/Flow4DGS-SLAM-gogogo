@@ -1,0 +1,5 @@
+# V5.2a full: same diagnostic criteria, max 12 sampled frozen sources.
+inherit_from: "configs/rgbd/bonn/v52a_balloon2_smoke.yaml"
+model_params:
+  v51d_temporal:
+    max_sources: 12
