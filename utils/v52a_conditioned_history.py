@@ -101,7 +101,7 @@ def predict_conditioned_history(*,model,source_uid,prior_uid,
         return base.detach().clone(),diag
     creation_ids=_masks(model,n,old.device)
     diag["n_history_available"]=int(len(rejected))
-    old_enough=creation_ids[rejected] <= k0
+    old_enough=(creation_ids[rejected]>=0) & (creation_ids[rejected]<=k0)
     diag["n_old_enough"]=int(old_enough.sum().item())
     candidate_ids=rejected[old_enough]
     if not len(candidate_ids):
@@ -189,7 +189,8 @@ def extend_source(*,pending,source_viewpoint,history_offset,diagnostics,
     # strict CSV schema equality across modes.
     history_row=dict(pending["source_rows"]["strict"])
     history_row.update(data)
-    history_row["n_candidate_gate_pass"]=int(diagnostics["n_history_predicted"])
+    history_row["n_candidate_gate_pass"]=(int(history_row["n_candidate_gate_pass"])
+         +int(diagnostics["n_history_predicted"]))
     history_row["n_actual_moved_from_hold"]=int(
         (history_offset!=pending["offsets"]["hold"]).any(-1).sum().item())
     pending["offsets"]["strict_history"]=history_offset.detach().clone()
