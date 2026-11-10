@@ -1,0 +1,16 @@
+# V5.1d smoke: one pre-Mapping GaussianModel freeze, 1/3/5 future KFs.
+# Online Mapping stays V5.1a SHADOW (= Legacy G0).
+inherit_from: "configs/rgbd/bonn/v51a_balloon2_shadow.yaml"
+model_params:
+  v51d_temporal:
+    enabled: true
+    every_n_event: 10
+    max_sources: 1
+    future_keyframe_orders: [1, 3, 5]
+    focused_source_frames: [342, 347, 352, 357, 362, 372, 382]
+    max_frame_gap: 45
+    min_dynamic_depth_pixels: 256
+    opacity_threshold: 0.1
+    uncovered_penalty_m: 0.5
+    boundary_width_px: 5
+    history_min_m: 0.005
