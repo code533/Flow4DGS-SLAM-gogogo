@@ -185,8 +185,15 @@ def extend_source(*,pending,source_viewpoint,history_offset,diagnostics,
                   "dynamic_depth_n","dynamic_rgb_n"):
         if data[field]!=pending["source_rows"]["strict"][field]:
             raise ValueError("V5.2a source evaluation targets mismatch")
+    # Match all original V5.1c source-row column keys to ensure
+    # strict CSV schema equality across modes.
+    history_row=dict(pending["source_rows"]["strict"])
+    history_row.update(data)
+    history_row["n_candidate_gate_pass"]=int(diagnostics["n_history_predicted"])
+    history_row["n_actual_moved_from_hold"]=int(
+        (history_offset!=pending["offsets"]["hold"]).any(-1).sum().item())
     pending["offsets"]["strict_history"]=history_offset.detach().clone()
-    pending["source_rows"]["strict_history"]=data
+    pending["source_rows"]["strict_history"]=history_row
     pending["history_diag"]=dict(diagnostics)
     return [dict(pending["source_rows"][mode],
                  source_keyframe_id=pending["source_uid"],
