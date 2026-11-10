@@ -49,6 +49,13 @@ from utils.v51c_controlled_attribution import (
     should_capture as v51c_should_capture,
     evaluate_controlled as v51c_evaluate_controlled,
     append_rows as v51c_append_rows)
+from utils.v51d_temporal_persistence import (
+    validate_protocol as v51d_validate_protocol,
+    selection_kind as v51d_selection_kind,
+    capture_source as v51d_capture_source,
+    evaluate_future as v51d_evaluate_future,
+    append_future_rows as v51d_append_future_rows,
+    log_event as v51d_log_event)
 
 def print_lrs(optimizer, step, every=50):
     if step % every != 0:
@@ -450,6 +457,17 @@ class BackEnd(mp.Process):
         self.v51c_captured = 0
         self.v51c_every = int(self.v51c_cfg.get("every_n_event", 10))
         self.v51c_limit = int(self.v51c_cfg.get("max_sources", 12))
+        self.v51d_cfg = config["model_params"].get("v51d_temporal", {})
+        self.v51d_enabled = bool(self.v51d_cfg.get("enabled", False))
+        self.v51d_event_index = 0
+        self.v51d_captured = 0
+        self.v51d_every = int(self.v51d_cfg.get("every_n_event", 10))
+        self.v51d_limit = int(self.v51d_cfg.get("max_sources", 12))
+        self.v51d_horizons = tuple(self.v51d_cfg.get("future_keyframe_orders",[1,3,5]))
+        self.v51d_focus = tuple(self.v51d_cfg.get(
+            "focused_source_frames",[342,347,352,357,362,372,382]))
+        self.v51d_max_frame_gap = int(self.v51d_cfg.get("max_frame_gap",45))
+        self.v51d_pending = None
         self.v50_cfg = config["model_params"].get("v50_attribution", {})
         self.v50_enabled = bool(self.v50_cfg.get("enabled", False))
         self.v50_event_index = 0
@@ -521,6 +539,21 @@ class BackEnd(mp.Process):
                 raise ValueError("V5.1c interval and source limit must be positive")
             if self.v43a_enabled or self.v50_enabled:
                 raise ValueError("Disable V4.3 and V5.0 diagnostics during V5.1c")
+        if self.v51d_enabled:
+            if self.v51a_mode != "shadow" or self.v51c_enabled:
+                raise ValueError("V5.1d requires V5.1a shadow and V5.1c disabled")
+            if self.v43a_enabled or self.v50_enabled:
+                raise ValueError("V5.1d is isolated from V4.3 and V5.0 diagnostics")
+            v51d_validate_protocol(
+                every_n_event=self.v51d_every,
+                max_sources=self.v51d_limit,
+                horizons=self.v51d_horizons,
+                max_frame_gap=self.v51d_max_frame_gap,
+                focused_source_frames=self.v51d_focus,
+                min_dynamic_depth_pixels=int(self.v51d_cfg.get("min_dynamic_depth_pixels",256)),
+                opacity_threshold=float(self.v51d_cfg.get("opacity_threshold",.1)),
+                uncovered_penalty_m=float(self.v51d_cfg.get("uncovered_penalty_m",.5)),
+                boundary_width_px=int(self.v51d_cfg.get("boundary_width_px",5)))
         if self.v51a_mode != "off" and self.v42a_cfg.get("online_trace", False):
             raise ValueError("V5.1a disables legacy V4.2b online trace, which uses pre-filter indices")
         self.insertion_type = config["model_params"].get("insertion_type", "new")
@@ -2104,6 +2137,63 @@ class BackEnd(mp.Process):
                         }
                     append_v51a_comparison(
                         os.path.join(self.save_dir,"v51a_projection"),row,details)
+                    if self.v51d_enabled:
+                        self.v51d_event_index += 1
+                        kind=v51d_selection_kind(
+                            self.v51d_event_index,int(viewpoint.uid),
+                            every_n_event=self.v51d_every,
+                            focus_ids=self.v51d_focus)
+                        if kind is not None:
+                            v51d_dir=os.path.join(self.save_dir,"v51d_temporal")
+                            if self.v51d_pending is not None:
+                                v51d_log_event(v51d_dir,source_uid=int(viewpoint.uid),
+                                    source_kind=kind,event_index=self.v51d_event_index,
+                                    action="source_skipped",reason="previous_snapshot_still_pending")
+                            elif self.v51d_captured >= self.v51d_limit:
+                                v51d_log_event(v51d_dir,source_uid=int(viewpoint.uid),
+                                    source_kind=kind,event_index=self.v51d_event_index,
+                                    action="source_skipped",reason="source_cap_reached")
+                            else:
+                                source_rows=v51c_evaluate_controlled(
+                                    model=self.gaussians,viewpoint=viewpoint,
+                                    prior_uid=int(closest_viewpoint.uid),
+                                    frame_id=int(viewpoint.uid),
+                                    event_index=self.v51d_event_index,
+                                    legacy_indices=idx2_valid.detach(),
+                                    legacy_g0=g0_v42a.detach(),
+                                    strict_indices=strict_idx.detach(),
+                                    strict_g0=v51a_strict_g0.detach(),
+                                    render_fn=render,pipeline=self.pipeline_params,
+                                    background=self.background,
+                                    opacity_threshold=float(self.v51d_cfg.get("opacity_threshold",.1)),
+                                    uncovered_penalty_m=float(self.v51d_cfg.get("uncovered_penalty_m",.5)),
+                                    boundary_width_px=int(self.v51d_cfg.get("boundary_width_px",5)),
+                                    history_min_m=float(self.v51d_cfg.get("history_min_m",.005)))
+                                # Do not capture on tiny/empty depth regions.
+                                if source_rows[0]["dynamic_depth_n"] < int(
+                                        self.v51d_cfg.get("min_dynamic_depth_pixels",256)):
+                                    v51d_log_event(v51d_dir,source_uid=int(viewpoint.uid),
+                                        source_kind=kind,event_index=self.v51d_event_index,
+                                        action="source_skipped",reason="too_few_source_dynamic_depth_pixels")
+                                else:
+                                    self.v51d_pending=v51d_capture_source(
+                                        model=self.gaussians,
+                                        source_uid=int(viewpoint.uid),
+                                        prior_uid=int(closest_viewpoint.uid),
+                                        event_index=self.v51d_event_index,
+                                        source_kind=kind,
+                                        legacy_indices=idx2_valid.detach(),
+                                        legacy_g0=g0_v42a.detach(),
+                                        strict_indices=strict_idx.detach(),
+                                        strict_g0=v51a_strict_g0.detach(),
+                                        source_rows=source_rows,clone_fn=clone_obj)
+                                    self.v51d_captured += 1
+                                    v51d_log_event(v51d_dir,source_uid=int(viewpoint.uid),
+                                        source_kind=kind,event_index=self.v51d_event_index,
+                                        action="source_captured",reason="pre_mapping_frozen")
+                                    print("[V5.1d] Captured KF={} ({}) [{}/{}]".format(
+                                        viewpoint.uid,kind,
+                                        self.v51d_captured,self.v51d_limit))
                     if self.v51c_enabled:
                         self.v51c_event_index += 1
                         if v51c_should_capture(self.v51c_event_index,
@@ -2523,6 +2613,15 @@ class BackEnd(mp.Process):
             else: # get info from frondend
                 data = self.backend_queue.get()
                 if data[0] == "stop":
+                    if self.v51d_enabled and self.v51d_pending is not None:
+                        pending=self.v51d_pending
+                        v51d_log_event(os.path.join(self.save_dir,"v51d_temporal"),
+                            source_uid=pending["source_uid"],
+                            source_kind=pending["source_kind"],
+                            event_index=pending["event_index"],
+                            action="snapshot_closed",reason="stream_ended_before_all_horizons")
+                        self.v51d_pending=None
+                        del pending
                     break
                 elif data[0] == "pause":
                     self.pause = True
@@ -2559,6 +2658,53 @@ class BackEnd(mp.Process):
                     depth_map = data[4]
                     add_new_gaussian = data[5]
                     dynamic_render = data[6]
+
+                    if self.v51d_enabled and self.v51d_pending is not None:
+                        # This incoming tracked keyframe has not entered any
+                        # Mapping/insertion/offset update. The frozen source
+                        # model is shared by all held-out render hypotheses.
+                        pending=self.v51d_pending
+                        pending["seen_future_keyframes"] += 1
+                        order=pending["seen_future_keyframes"]
+                        gap=int(viewpoint.uid)-pending["source_uid"]
+                        v51d_dir=os.path.join(self.save_dir,"v51d_temporal")
+                        if gap <= 0:
+                            raise ValueError("V5.1d received a non-future keyframe")
+                        if gap>self.v51d_max_frame_gap:
+                            v51d_log_event(v51d_dir,source_uid=pending["source_uid"],
+                                source_kind=pending["source_kind"],event_index=pending["event_index"],
+                                action="snapshot_closed",future_uid=int(viewpoint.uid),
+                                future_order=order,frame_gap=gap,reason="max_frame_gap_exceeded")
+                            self.v51d_pending=None
+                            del pending
+                        else:
+                            if order in self.v51d_horizons:
+                                future_rows,status=v51d_evaluate_future(
+                                    pending=pending,viewpoint=viewpoint,
+                                    future_keyframe_order=order,
+                                    render_fn=render,pipeline=self.pipeline_params,
+                                    background=self.background,
+                                    opacity_threshold=float(self.v51d_cfg.get("opacity_threshold",.1)),
+                                    uncovered_penalty_m=float(self.v51d_cfg.get("uncovered_penalty_m",.5)),
+                                    boundary_width_px=int(self.v51d_cfg.get("boundary_width_px",5)),
+                                    min_dynamic_depth_pixels=int(
+                                        self.v51d_cfg.get("min_dynamic_depth_pixels",256)))
+                                if future_rows:
+                                    v51d_append_future_rows(v51d_dir,future_rows)
+                                v51d_log_event(v51d_dir,source_uid=pending["source_uid"],
+                                    source_kind=pending["source_kind"],event_index=pending["event_index"],
+                                    action="future_"+status,
+                                    future_uid=int(viewpoint.uid),future_order=order,frame_gap=gap,
+                                    reason=status)
+                                print("[V5.1d] Source={} future={} KF-order={} status={}".format(
+                                    pending["source_uid"],viewpoint.uid,order,status))
+                            if order>=max(self.v51d_horizons):
+                                v51d_log_event(v51d_dir,source_uid=pending["source_uid"],
+                                    source_kind=pending["source_kind"],event_index=pending["event_index"],
+                                    action="snapshot_closed",future_uid=int(viewpoint.uid),
+                                    future_order=order,frame_gap=gap,reason="all_horizons_consumed")
+                                self.v51d_pending=None
+                                del pending
 
                     if self.v43a2_pending is not None:
                         # Consume BEFORE adding keyframe, inserting Gaussians,
