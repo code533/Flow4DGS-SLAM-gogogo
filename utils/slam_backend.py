@@ -53,6 +53,7 @@ from utils.v51d_temporal_persistence import (
     validate_protocol as v51d_validate_protocol,
     selection_kind as v51d_selection_kind,
     capture_source as v51d_capture_source,
+    append_source_rows as v51d_append_source_rows,
     evaluate_future as v51d_evaluate_future,
     append_future_rows as v51d_append_future_rows,
     log_event as v51d_log_event)
@@ -2176,6 +2177,7 @@ class BackEnd(mp.Process):
                                         source_kind=kind,event_index=self.v51d_event_index,
                                         action="source_skipped",reason="too_few_source_dynamic_depth_pixels")
                                 else:
+                                    v51d_append_source_rows(v51d_dir,source_rows)
                                     self.v51d_pending=v51d_capture_source(
                                         model=self.gaussians,
                                         source_uid=int(viewpoint.uid),
