@@ -118,10 +118,11 @@ within-snapshot paired rendering is the object of this study.
 ```
 <run>/v51d_temporal/
   v51d_event_log.csv
+  v51d_source_per_keyframe.csv
   v51d_future_per_horizon.csv
 ```
 
-- `v51d_event_log.csv`: source captures/skips, future evaluations,
+- `v51d_source_per_keyframe.csv`: three matched source-frame rows for each frozen snapshot, useful when future observations are missing.\n- `v51d_event_log.csv`: source captures/skips, future evaluations,
   per-source completed/expired/stream-ended status and reasons.
 - `v51d_future_per_horizon.csv`: three rows (hold/legacy/strict)
   per evaluated (source, future order) pair; future RGB, depth, PSNR,
