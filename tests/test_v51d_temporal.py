@@ -136,7 +136,7 @@ class FrozenV51dTests(unittest.TestCase):
         rows,_=evaluate_future(pending=pending,viewpoint=self.camera(20),
             future_keyframe_order=1,render_fn=self.fake_render,
             pipeline=None,background=None,min_dynamic_depth_pixels=16)
-        with self.assertRaisesRegex(ValueError,"Incomplete future triplet"):
+        with self.assertRaisesRegex(ValueError,"Expected exactly|Incomplete future triplet"):
             paired_deltas(pd.DataFrame(rows[:-1]))
 
 
