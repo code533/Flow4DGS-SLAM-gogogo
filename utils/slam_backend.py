@@ -57,6 +57,13 @@ from utils.v51d_temporal_persistence import (
     evaluate_future as v51d_evaluate_future,
     append_future_rows as v51d_append_future_rows,
     log_event as v51d_log_event)
+from utils.v52a_conditioned_history import (
+    validate_history_cfg as v52a_validate_cfg,
+    predict_conditioned_history as v52a_predict,
+    extend_source as v52a_extend_source,
+    evaluate_four_future as v52a_evaluate_future,
+    append_source_rows as v52a_append_source_rows,
+    append_future_rows as v52a_append_future_rows)
 
 def print_lrs(optimizer, step, every=50):
     if step % every != 0:
@@ -469,6 +476,8 @@ class BackEnd(mp.Process):
             "focused_source_frames",[342,347,352,357,362,372,382]))
         self.v51d_max_frame_gap = int(self.v51d_cfg.get("max_frame_gap",45))
         self.v51d_pending = None
+        self.v52a_cfg = config["model_params"].get("v52a_history", {})
+        self.v52a_enabled = bool(self.v52a_cfg.get("enabled", False))
         self.v50_cfg = config["model_params"].get("v50_attribution", {})
         self.v50_enabled = bool(self.v50_cfg.get("enabled", False))
         self.v50_event_index = 0
@@ -555,6 +564,16 @@ class BackEnd(mp.Process):
                 opacity_threshold=float(self.v51d_cfg.get("opacity_threshold",.1)),
                 uncovered_penalty_m=float(self.v51d_cfg.get("uncovered_penalty_m",.5)),
                 boundary_width_px=int(self.v51d_cfg.get("boundary_width_px",5)))
+        if self.v52a_enabled:
+            if not self.v51d_enabled or self.v51c_enabled or self.v51a_mode != "shadow":
+                raise ValueError("V5.2a requires V5.1d frozen shadow (no online history updates)")
+            v52a_validate_cfg(
+                min_step_m=float(self.v52a_cfg.get("min_step_m",.005)),
+                max_speed_m_per_frame=float(self.v52a_cfg.get("max_speed_m_per_frame",.04)),
+                min_direction_cos=float(self.v52a_cfg.get("min_direction_cos",.5)),
+                max_speed_ratio=float(self.v52a_cfg.get("max_speed_ratio",2.)),
+                max_predicted_increment_m=float(self.v52a_cfg.get("max_predicted_increment_m",.10)),
+                history_frame_gap_cap=int(self.v52a_cfg.get("history_frame_gap_cap",20)))
         if self.v51a_mode != "off" and self.v42a_cfg.get("online_trace", False):
             raise ValueError("V5.1a disables legacy V4.2b online trace, which uses pre-filter indices")
         self.insertion_type = config["model_params"].get("insertion_type", "new")
@@ -2189,6 +2208,45 @@ class BackEnd(mp.Process):
                                         strict_indices=strict_idx.detach(),
                                         strict_g0=v51a_strict_g0.detach(),
                                         source_rows=source_rows,clone_fn=clone_obj)
+                                    if self.v52a_enabled:
+                                        history_offset,history_diag=v52a_predict(
+                                            model=self.gaussians,
+                                            source_uid=int(viewpoint.uid),
+                                            prior_uid=int(closest_viewpoint.uid),
+                                            legacy_indices=idx2_valid.detach(),
+                                            legacy_g0=g0_v42a.detach(),
+                                            strict_indices=strict_idx.detach(),
+                                            strict_g0=v51a_strict_g0.detach(),
+                                            min_step_m=float(self.v52a_cfg.get("min_step_m",.005)),
+                                            max_speed_m_per_frame=float(
+                                                self.v52a_cfg.get("max_speed_m_per_frame",.04)),
+                                            min_direction_cos=float(
+                                                self.v52a_cfg.get("min_direction_cos",.5)),
+                                            max_speed_ratio=float(
+                                                self.v52a_cfg.get("max_speed_ratio",2.)),
+                                            max_predicted_increment_m=float(
+                                                self.v52a_cfg.get("max_predicted_increment_m",.10)),
+                                            history_frame_gap_cap=int(
+                                                self.v52a_cfg.get("history_frame_gap_cap",20)))
+                                        four_source=v52a_extend_source(
+                                            pending=self.v51d_pending,
+                                            source_viewpoint=viewpoint,
+                                            history_offset=history_offset,
+                                            diagnostics=history_diag,
+                                            render_fn=render,
+                                            pipeline=self.pipeline_params,
+                                            background=self.background,
+                                            opacity_threshold=float(
+                                                self.v51d_cfg.get("opacity_threshold",.1)),
+                                            uncovered_penalty_m=float(
+                                                self.v51d_cfg.get("uncovered_penalty_m",.5)),
+                                            boundary_width_px=int(
+                                                self.v51d_cfg.get("boundary_width_px",5)))
+                                        v52a_append_source_rows(v51d_dir,four_source)
+                                        print("[V5.2a] source={} excluded={} predicted={} capped={}".format(
+                                            viewpoint.uid,history_diag["n_fov_excluded"],
+                                            history_diag["n_history_predicted"],
+                                            history_diag["n_history_clipped"]))
                                     self.v51d_captured += 1
                                     v51d_log_event(v51d_dir,source_uid=int(viewpoint.uid),
                                         source_kind=kind,event_index=self.v51d_event_index,
@@ -2681,18 +2739,35 @@ class BackEnd(mp.Process):
                             del pending
                         else:
                             if order in self.v51d_horizons:
-                                future_rows,status=v51d_evaluate_future(
-                                    pending=pending,viewpoint=viewpoint,
-                                    future_keyframe_order=order,
-                                    render_fn=render,pipeline=self.pipeline_params,
-                                    background=self.background,
-                                    opacity_threshold=float(self.v51d_cfg.get("opacity_threshold",.1)),
-                                    uncovered_penalty_m=float(self.v51d_cfg.get("uncovered_penalty_m",.5)),
-                                    boundary_width_px=int(self.v51d_cfg.get("boundary_width_px",5)),
-                                    min_dynamic_depth_pixels=int(
-                                        self.v51d_cfg.get("min_dynamic_depth_pixels",256)))
+                                # V5.2a four-way and V5.1d three-way use the
+                                # same frozen snapshot and future camera.
+                                if self.v52a_enabled:
+                                    future_rows,status=v52a_evaluate_future(
+                                        pending=pending,viewpoint=viewpoint,
+                                        future_keyframe_order=order,
+                                        render_fn=render,pipeline=self.pipeline_params,
+                                        background=self.background,
+                                        opacity_threshold=float(self.v51d_cfg.get("opacity_threshold",.1)),
+                                        uncovered_penalty_m=float(self.v51d_cfg.get("uncovered_penalty_m",.5)),
+                                        boundary_width_px=int(self.v51d_cfg.get("boundary_width_px",5)),
+                                        min_dynamic_depth_pixels=int(
+                                            self.v51d_cfg.get("min_dynamic_depth_pixels",256)))
+                                else:
+                                    future_rows,status=v51d_evaluate_future(
+                                        pending=pending,viewpoint=viewpoint,
+                                        future_keyframe_order=order,
+                                        render_fn=render,pipeline=self.pipeline_params,
+                                        background=self.background,
+                                        opacity_threshold=float(self.v51d_cfg.get("opacity_threshold",.1)),
+                                        uncovered_penalty_m=float(self.v51d_cfg.get("uncovered_penalty_m",.5)),
+                                        boundary_width_px=int(self.v51d_cfg.get("boundary_width_px",5)),
+                                        min_dynamic_depth_pixels=int(
+                                            self.v51d_cfg.get("min_dynamic_depth_pixels",256)))
                                 if future_rows:
-                                    v51d_append_future_rows(v51d_dir,future_rows)
+                                    if self.v52a_enabled:
+                                        v52a_append_future_rows(v51d_dir,future_rows)
+                                    else:
+                                        v51d_append_future_rows(v51d_dir,future_rows)
                                 v51d_log_event(v51d_dir,source_uid=pending["source_uid"],
                                     source_kind=pending["source_kind"],event_index=pending["event_index"],
                                     action="future_"+status,
